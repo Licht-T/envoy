@@ -29,6 +29,7 @@ public:
   virtual void onMoreClientLoginResponse(ClientLoginResponse&) PURE;
   virtual void onCommand(Command&) PURE;
   virtual void onCommandResponse(CommandResponse&) PURE;
+  virtual bool onSSLRequest() PURE;
 };
 
 /**
@@ -38,7 +39,14 @@ class Decoder {
 public:
   virtual ~Decoder() = default;
 
-  virtual void onData(Buffer::Instance& data) PURE;
+  enum class Result {
+    ReadyForNext, // Decoder processed previous message and is ready for the next message.
+    Stopped // Received and processed message disrupts the current flow. Decoder stopped accepting
+            // data. This happens when decoder wants filter to perform some action, for example to
+            // call starttls transport socket to enable TLS.
+  };
+
+  virtual Result onData(Buffer::Instance& data) PURE;
   virtual MySQLSession& getSession() PURE;
 
   const Extensions::Common::SQLUtils::SQLUtils::DecoderAttributes& getAttributes() const {

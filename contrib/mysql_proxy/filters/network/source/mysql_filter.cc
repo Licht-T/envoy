@@ -16,8 +16,10 @@ namespace Extensions {
 namespace NetworkFilters {
 namespace MySQLProxy {
 
-MySQLFilterConfig::MySQLFilterConfig(const std::string& stat_prefix, Stats::Scope& scope)
-    : scope_(scope), stats_(generateStats(stat_prefix, scope)) {}
+MySQLFilterConfig::MySQLFilterConfig(const std::string& stat_prefix, Stats::Scope& scope, bool terminate_ssl)
+    : scope_(scope),
+      stats_(generateStats(stat_prefix, scope)),
+      terminate_ssl_(terminate_ssl) {}
 
 MySQLFilter::MySQLFilter(MySQLFilterConfigSharedPtr config) : config_(std::move(config)) {}
 
@@ -30,7 +32,7 @@ Network::FilterStatus MySQLFilter::onData(Buffer::Instance& data, bool) {
   // This can be removed once we are more confident of this code.
   if (sniffing_) {
     read_buffer_.add(data);
-    doDecode(read_buffer_);
+    return doDecode(read_buffer_);
   }
   return Network::FilterStatus::Continue;
 }
@@ -40,12 +42,44 @@ Network::FilterStatus MySQLFilter::onWrite(Buffer::Instance& data, bool) {
   // This can be removed once we are more confident of this code.
   if (sniffing_) {
     write_buffer_.add(data);
-    doDecode(write_buffer_);
+    return doDecode(write_buffer_);
   }
   return Network::FilterStatus::Continue;
 }
 
-void MySQLFilter::doDecode(Buffer::Instance& buffer) {
+bool MySQLFilter::onSSLRequest() {
+  if (!config_->terminate_ssl_) {
+    return true;
+  }
+
+  // Add callback to be notified when the reply message has been
+  // transmitted.
+  read_callbacks_->connection().addBytesSentCallback([=](uint64_t bytes) -> bool {
+    // Wait until 'S' has been transmitted.
+    if (bytes >= 1) {
+      if (!read_callbacks_->connection().startSecureTransport()) {
+        ENVOY_CONN_LOG(info, "mysql_proxy: cannot enable secure transport. Check configuration.",
+                       read_callbacks_->connection());
+        read_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush);
+      } else {
+        // Unsubscribe the callback.
+        // config_->stats_.sessions_terminated_ssl_.inc();
+        ENVOY_CONN_LOG(trace, "mysql_proxy: enabled SSL termination.",
+                       read_callbacks_->connection());
+        // Switch to TLS has been completed.
+        // Signal to the decoder to stop processing the current message (SSLRequest).
+        // Because Envoy terminates SSL, the message was consumed and should not be
+        // passed to other filters in the chain.
+        return false;
+      }
+    }
+    return true;
+  });
+
+  return false;
+}
+
+Network::FilterStatus MySQLFilter::doDecode(Buffer::Instance& buffer) {
   // Clear dynamic metadata.
   envoy::config::core::v3::Metadata& dynamic_metadata =
       read_callbacks_->connection().streamInfo().dynamicMetadata();
@@ -58,7 +92,12 @@ void MySQLFilter::doDecode(Buffer::Instance& buffer) {
   }
 
   try {
-    decoder_->onData(buffer);
+    switch (decoder_->onData(buffer)) {
+    case Decoder::Result::ReadyForNext:
+      return Network::FilterStatus::Continue;
+    case Decoder::Result::Stopped:
+      return Network::FilterStatus::StopIteration;
+    }
   } catch (EnvoyException& e) {
     ENVOY_LOG(info, "mysql_proxy: decoding error: {}", e.what());
     config_->stats_.decoder_errors_.inc();
@@ -66,6 +105,8 @@ void MySQLFilter::doDecode(Buffer::Instance& buffer) {
     read_buffer_.drain(read_buffer_.length());
     write_buffer_.drain(write_buffer_.length());
   }
+
+  return Network::FilterStatus::Continue;
 }
 
 DecoderPtr MySQLFilter::createDecoder(DecoderCallbacks& callbacks) {

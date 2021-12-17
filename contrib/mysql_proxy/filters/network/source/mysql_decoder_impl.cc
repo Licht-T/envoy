@@ -213,11 +213,22 @@ bool DecoderImpl::decode(Buffer::Instance& data) {
   return true;
 }
 
-void DecoderImpl::onData(Buffer::Instance& data) {
+Decoder::Result DecoderImpl::onData(Buffer::Instance& data) {
   // TODO(venilnoronha): handle messages over 16 mb. See
   // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_packets.html#sect_protocol_basic_packets_sending_mt_16mb.
-  while (!BufferHelper::endOfBuffer(data) && decode(data)) {
-  }
+  do {
+    if (session_.getState() != MySQLSession::State::SslPt) {
+      continue;
+    }
+
+    if (!callbacks_.onSSLRequest()) {
+      session_.setState(MySQLSession::State::ChallengeReq);
+      data.drain( data.length());
+      return Decoder::Result::Stopped;
+    }
+  } while (!BufferHelper::endOfBuffer(data) && decode(data));
+
+  return Decoder::Result::ReadyForNext;
 }
 
 DecoderFactoryImpl DecoderFactoryImpl::instance_;
