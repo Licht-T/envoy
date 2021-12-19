@@ -212,7 +212,7 @@ DecodeStatus BufferHelper::peekHdr(Buffer::Instance& buffer, uint32_t& len, uint
   }
   seq = htobe32(val) & MYSQL_HDR_SEQ_MASK;
   len = val & MYSQL_HDR_PKT_SIZE_MASK;
-  ENVOY_LOG(trace, "mysql_proxy: MYSQL-hdrseq {}, len {}", seq, len);
+  //ENVOY_LOG(trace, "mysql_proxy: MYSQL-hdrseq {}, len {}", seq, len);
   return DecodeStatus::Success;
 }
 

@@ -10,6 +10,7 @@
 #include "contrib/mysql_proxy/filters/network/source/mysql_codec.h"
 #include "contrib/mysql_proxy/filters/network/source/mysql_codec_clogin_resp.h"
 #include "contrib/mysql_proxy/filters/network/source/mysql_decoder_impl.h"
+#include "contrib/mysql_proxy/filters/network/source/mysql_utils.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -27,24 +28,103 @@ void MySQLFilter::initializeReadFilterCallbacks(Network::ReadFilterCallbacks& ca
   read_callbacks_ = &callbacks;
 }
 
+void MySQLFilter::initializeWriteFilterCallbacks(Network::WriteFilterCallbacks& callbacks) {
+  write_callbacks_ = &callbacks;
+}
+
 Network::FilterStatus MySQLFilter::onData(Buffer::Instance& data, bool) {
   // Safety measure just to make sure that if we have a decoding error we keep going and lose stats.
   // This can be removed once we are more confident of this code.
-  if (sniffing_) {
-    read_buffer_.add(data);
-    return doDecode(read_buffer_);
+  printf("---------------on data\n");
+  Network::FilterStatus status = Network::FilterStatus::Continue;
+  MySQLSession::State current_state = decoder_->getSession().getState();
+
+  if (!sniffing_) {
+    return status;
   }
-  return Network::FilterStatus::Continue;
+
+  read_buffer_.add(data);
+  status = doDecode(read_buffer_, true);
+  if (status == Network::FilterStatus::StopIteration) {
+    sequence_id_offset_++;
+    data.drain(data.length());
+    decoder_->getSession().incUpstreamDrained();
+    return status;
+  }
+
+  uint64_t remaining = data.length();
+  printf("-------------remain %ld\n", remaining);
+  while (remaining > 0) {
+    uint32_t len = 0;
+    uint8_t seq = 0;
+
+    BufferHelper::peekHdr(data, len, seq);
+    BufferHelper::consumeHdr(data);
+    remaining -= 4;
+
+    BufferHelper::addUint24(data, len);
+    BufferHelper::addUint8(data, seq - sequence_id_offset_);
+    //printf("---------------on data offset: %d, seq: %d\n", sequence_id_offset_, seq);
+
+    if (config_->terminate_ssl_ && current_state == MySQLSession::State::ChallengeReq){
+      uint32_t client_cap = 0;
+      BufferHelper::readUint32(data, client_cap);
+      remaining -= 4;
+      len -= 4;
+      BufferHelper::addUint32(data, client_cap ^ CLIENT_SSL);
+    }
+
+    std::string payload;
+    payload.reserve(len);
+    BufferHelper::readStringBySize(data, len, payload);
+    remaining -= len;
+    BufferHelper::addBytes(data, payload.c_str(), payload.size());
+  }
+
+  printf("---------------on data end\n");
+  return status;
 }
 
 Network::FilterStatus MySQLFilter::onWrite(Buffer::Instance& data, bool) {
   // Safety measure just to make sure that if we have a decoding error we keep going and lose stats.
   // This can be removed once we are more confident of this code.
+  printf("---------------on write\n");
+  Network::FilterStatus status = Network::FilterStatus::Continue;
+
   if (sniffing_) {
     write_buffer_.add(data);
-    return doDecode(write_buffer_);
+    status = doDecode(write_buffer_, false);
+
+    if (status == Network::FilterStatus::StopIteration) {
+      sequence_id_offset_--;
+      data.drain(data.length());
+      decoder_->getSession().incDownstreamDrained();
+      return status;
+    }
   }
-  return Network::FilterStatus::Continue;
+
+  uint64_t remaining = data.length();
+  while (remaining > 0) {
+    uint32_t len = 0;
+    uint8_t seq = 0;
+
+    BufferHelper::peekHdr(data, len, seq);
+    BufferHelper::addUint24(data, len);
+    BufferHelper::addUint8(data, seq + sequence_id_offset_);
+    printf("---------------on write offset: %d, seq: %d\n", sequence_id_offset_, seq);
+
+    BufferHelper::consumeHdr(data);
+    remaining -= 4;
+
+    std::string payload;
+    payload.reserve(len);
+    BufferHelper::readStringBySize(data, len, payload);
+    remaining -= len;
+    BufferHelper::addBytes(data, payload.c_str(), payload.size());
+  }
+
+  printf("---------------on write end\n");
+  return status;
 }
 
 bool MySQLFilter::onSSLRequest() {
@@ -52,34 +132,19 @@ bool MySQLFilter::onSSLRequest() {
     return true;
   }
 
-  // Add callback to be notified when the reply message has been
-  // transmitted.
-  read_callbacks_->connection().addBytesSentCallback([=](uint64_t bytes) -> bool {
-    // Wait until 'S' has been transmitted.
-    if (bytes >= 1) {
-      if (!read_callbacks_->connection().startSecureTransport()) {
-        ENVOY_CONN_LOG(info, "mysql_proxy: cannot enable secure transport. Check configuration.",
-                       read_callbacks_->connection());
-        read_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush);
-      } else {
-        // Unsubscribe the callback.
-        // config_->stats_.sessions_terminated_ssl_.inc();
-        ENVOY_CONN_LOG(trace, "mysql_proxy: enabled SSL termination.",
-                       read_callbacks_->connection());
-        // Switch to TLS has been completed.
-        // Signal to the decoder to stop processing the current message (SSLRequest).
-        // Because Envoy terminates SSL, the message was consumed and should not be
-        // passed to other filters in the chain.
-        return false;
-      }
-    }
-    return true;
-  });
+  if (!read_callbacks_->connection().startSecureTransport()) {
+    ENVOY_CONN_LOG(info, "mysql_proxy: cannot enable secure transport. Check configuration.",
+                   read_callbacks_->connection());
+    read_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush);
+  } else {
+    ENVOY_CONN_LOG(trace, "mysql_proxy: enabled SSL termination.",
+                   read_callbacks_->connection());
+  }
 
   return false;
 }
 
-Network::FilterStatus MySQLFilter::doDecode(Buffer::Instance& buffer) {
+Network::FilterStatus MySQLFilter::doDecode(Buffer::Instance& buffer, bool is_upstream) {
   // Clear dynamic metadata.
   envoy::config::core::v3::Metadata& dynamic_metadata =
       read_callbacks_->connection().streamInfo().dynamicMetadata();
@@ -92,7 +157,7 @@ Network::FilterStatus MySQLFilter::doDecode(Buffer::Instance& buffer) {
   }
 
   try {
-    switch (decoder_->onData(buffer)) {
+    switch (decoder_->onData(buffer, is_upstream)) {
     case Decoder::Result::ReadyForNext:
       return Network::FilterStatus::Continue;
     case Decoder::Result::Stopped:

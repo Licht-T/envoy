@@ -46,7 +46,7 @@ public:
             // call starttls transport socket to enable TLS.
   };
 
-  virtual Result onData(Buffer::Instance& data) PURE;
+  virtual Result onData(Buffer::Instance& data, bool is_upstream) PURE;
   virtual MySQLSession& getSession() PURE;
 
   const Extensions::Common::SQLUtils::SQLUtils::DecoderAttributes& getAttributes() const {
