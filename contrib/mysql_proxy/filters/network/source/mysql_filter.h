@@ -77,7 +77,6 @@ public:
   Network::FilterStatus onData(Buffer::Instance& data, bool end_stream) override;
   Network::FilterStatus onNewConnection() override;
   void initializeReadFilterCallbacks(Network::ReadFilterCallbacks& callbacks) override;
-  void initializeWriteFilterCallbacks(Network::WriteFilterCallbacks& callbacks) override;
 
   // Network::WriteFilter
   Network::FilterStatus onWrite(Buffer::Instance& data, bool end_stream) override;
@@ -94,21 +93,18 @@ public:
   void onCommandResponse(CommandResponse&) override{};
   bool onSSLRequest() override;
 
-  uint8_t getSequenceIdOffset() { return sequence_id_offset_; };
-
   Network::FilterStatus doDecode(Buffer::Instance& buffer, bool is_upstream);
   DecoderPtr createDecoder(DecoderCallbacks& callbacks);
+  void doRewrite(Buffer::Instance& buffer, bool is_upstream);
   MySQLSession& getSession() { return decoder_->getSession(); }
 
 private:
   Network::ReadFilterCallbacks* read_callbacks_{};
-  Network::WriteFilterCallbacks* write_callbacks_{};
   MySQLFilterConfigSharedPtr config_;
   Buffer::OwnedImpl read_buffer_;
   Buffer::OwnedImpl write_buffer_;
   std::unique_ptr<Decoder> decoder_;
   bool sniffing_{true};
-  uint8_t sequence_id_offset_{0};
 };
 
 } // namespace MySQLProxy

@@ -25,19 +25,27 @@ public:
     Error = 13,
   };
 
+  struct PayloadMetadata {
+    uint8_t seq;
+    uint32_t len;
+  };
+
   void setState(MySQLSession::State state) { state_ = state; }
   MySQLSession::State getState() { return state_; }
-  uint8_t getExpectedSeq(bool is_upstream) { return expected_seq_ - (is_upstream ? downstream_drained_ : upstream_drained_); }
-  void resetExpectedSeq() { expected_seq_ = MYSQL_REQUEST_PKT_NUM; upstream_drained_ = 0; downstream_drained_ = 0; }
-  void incExpectedSeq() { expected_seq_++; }
+  uint8_t getExpectedSeq(bool is_upstream) { return seq_ - (is_upstream ? downstream_drained_ : upstream_drained_); }
+  uint8_t getExpectedSeqForReciever(bool is_upstream) { return seq_ - (is_upstream ? upstream_drained_ : downstream_drained_); }
+  void resetSeq() { seq_ = MYSQL_REQUEST_PKT_NUM; upstream_drained_ = 0; downstream_drained_ = 0; }
+  void incSeq() { seq_++; }
   void incUpstreamDrained() { upstream_drained_++; }
   void incDownstreamDrained() { downstream_drained_++; }
+  std::vector<PayloadMetadata>& getPayloadMetadataList() { return payload_metadata_list_; }
 
 private:
   MySQLSession::State state_{State::Init};
-  uint8_t expected_seq_{0};
+  uint8_t seq_{0};
   uint8_t upstream_drained_{0};
   uint8_t downstream_drained_{0};
+  std::vector<PayloadMetadata> payload_metadata_list_{};
 };
 
 } // namespace MySQLProxy

@@ -20,41 +20,33 @@ void DecoderImpl::parseMessage(Buffer::Instance& message, uint8_t seq, uint32_t 
     ServerGreeting greeting;
     greeting.decode(message, seq, len);
     session_.setState(MySQLSession::State::ChallengeReq);
-    printf("^^^^^^^^^^^^^^^^^^^^^^^^greet\n");
     callbacks_.onServerGreeting(greeting);
     break;
   }
   case MySQLSession::State::ChallengeReq: {
     // Process Client Handshake Response
-    printf("^^^^^^^^^^^^^^^^^^^^^^^^challenge\n");
     ClientLogin client_login{};
     client_login.decode(message, seq, len);
 
     if (len == 32 && client_login.isSSLRequest()) {
       session_.setState(MySQLSession::State::SslPt);
-      printf("^^^^^^^^^^^^^^^^^^^^^^^^set sslpt\n");
     } else if (client_login.isResponse41()) {
       session_.setState(MySQLSession::State::ChallengeResp41);
-      printf("^^^^^^^^^^^^^^^^^^^^^^^^resp 41!!!!!!!!!!!!\n");
     } else {
       session_.setState(MySQLSession::State::ChallengeResp320);
-      printf("^^^^^^^^^^^^^^^^^^^^^^^^resp 320!!!!!!!!!!!!\n");
     }
     callbacks_.onClientLogin(client_login);
     break;
   }
   case MySQLSession::State::SslPt:
-    printf("^^^^^^^^^^^^^^^^^^^^^^^^sslpt\n");
     // just consume
     message.drain(len);
     break;
   case MySQLSession::State::ChallengeResp41:
   case MySQLSession::State::ChallengeResp320: {
-    printf("!!!!!!!!!!!!!!!!!!cr start\n");
     uint8_t resp_code;
     if (BufferHelper::peekUint8(message, resp_code) != DecodeStatus::Success) {
       session_.setState(MySQLSession::State::NotHandled);
-      printf("!!!!!!!!!!!!!!!!!!cr nh1\n");
       break;
     }
     std::unique_ptr<ClientLoginResponse> msg;
@@ -65,7 +57,7 @@ void DecoderImpl::parseMessage(Buffer::Instance& message, uint8_t seq, uint32_t 
       msg = std::make_unique<OkMessage>();
       state = MySQLSession::State::Req;
       // reset seq# when entering the REQ state
-      session_.resetExpectedSeq();
+      session_.resetSeq();
       break;
     }
     case MYSQL_RESP_AUTH_SWITCH: {
@@ -84,7 +76,6 @@ void DecoderImpl::parseMessage(Buffer::Instance& message, uint8_t seq, uint32_t 
     }
     default:
       session_.setState(state);
-      printf("!!!!!!!!!!!!!!!!!!cr nh2\n");
       return;
     }
     msg->decode(message, seq, len);
@@ -113,7 +104,7 @@ void DecoderImpl::parseMessage(Buffer::Instance& message, uint8_t seq, uint32_t 
     case MYSQL_RESP_OK: {
       msg = std::make_unique<OkMessage>();
       state = MySQLSession::State::Req;
-      session_.resetExpectedSeq();
+      session_.resetSeq();
       break;
     }
     case MYSQL_RESP_MORE: {
@@ -125,7 +116,7 @@ void DecoderImpl::parseMessage(Buffer::Instance& message, uint8_t seq, uint32_t 
       msg = std::make_unique<ErrMessage>();
       // stop parsing auth req/response, attempt to resync in command state
       state = MySQLSession::State::Resync;
-      session_.resetExpectedSeq();
+      session_.resetSeq();
       break;
     }
     case MYSQL_RESP_AUTH_SWITCH: {
@@ -194,29 +185,38 @@ bool DecoderImpl::decode(Buffer::Instance& data, bool is_upstream) {
   // If message is split over multiple packets, hold off until the entire message is available.
   // Consider the size of the header here as it's not consumed yet.
   if (sizeof(uint32_t) + len > data.length()) {
+    // FIXME: DrainせずにStopさせるか、Header rewrite対象にする
     return false;
   }
 
   BufferHelper::consumeHdr(data); // Consume the header once the message is fully available.
   callbacks_.onNewMessage(session_.getState());
 
-  printf("!!!!!!!!!!!!!!!!!!!!Seq: %d, Exp: %d\n", seq, session_.getExpectedSeq(is_upstream));
   // Ignore duplicate and out-of-sync packets.
   if (seq != session_.getExpectedSeq(is_upstream)) {
     // case when server response is over, and client send req
     if (session_.getState() == MySQLSession::State::ReqResp && seq == MYSQL_REQUEST_PKT_NUM) {
-      printf("!!!!!!!!!!!!!!!!!!!!Pattern 1\n");
-      session_.resetExpectedSeq();
+      session_.resetSeq();
       session_.setState(MySQLSession::State::Req);
     } else {
-      printf("!!!!!!!!!!!!!!!!!!!!Pattern 2\n");
       ENVOY_LOG(info, "mysql_proxy: ignoring out-of-sync packet");
       callbacks_.onProtocolError();
       data.drain(len); // Ensure that the whole message was consumed
+      // FIXME: convertSeqOnRecieverを実装しておきかえる
+      session_.getPayloadMetadataList().push_back({
+        .seq=session_.getExpectedSeqForReciever(is_upstream),
+        .len=len
+      });
       return true;
     }
   }
-  session_.incExpectedSeq();
+
+  session_.getPayloadMetadataList().push_back({
+    .seq=session_.getExpectedSeqForReciever(is_upstream),
+    .len=len
+  });
+
+  session_.incSeq();
 
   const ssize_t data_len = data.length();
   parseMessage(data, seq, len);
@@ -228,6 +228,8 @@ bool DecoderImpl::decode(Buffer::Instance& data, bool is_upstream) {
 }
 
 Decoder::Result DecoderImpl::onData(Buffer::Instance& data, bool is_upstream) {
+  session_.getPayloadMetadataList().clear();
+
   // TODO(venilnoronha): handle messages over 16 mb. See
   // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_packets.html#sect_protocol_basic_packets_sending_mt_16mb.
   while (!BufferHelper::endOfBuffer(data) && decode(data, is_upstream)) {

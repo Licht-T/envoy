@@ -28,102 +28,55 @@ void MySQLFilter::initializeReadFilterCallbacks(Network::ReadFilterCallbacks& ca
   read_callbacks_ = &callbacks;
 }
 
-void MySQLFilter::initializeWriteFilterCallbacks(Network::WriteFilterCallbacks& callbacks) {
-  write_callbacks_ = &callbacks;
-}
-
 Network::FilterStatus MySQLFilter::onData(Buffer::Instance& data, bool) {
+  Network::FilterStatus status = Network::FilterStatus::Continue;
+
   // Safety measure just to make sure that if we have a decoding error we keep going and lose stats.
   // This can be removed once we are more confident of this code.
-  printf("---------------on data\n");
-  Network::FilterStatus status = Network::FilterStatus::Continue;
-  MySQLSession::State current_state = decoder_->getSession().getState();
-
   if (!sniffing_) {
     return status;
   }
 
   read_buffer_.add(data);
   status = doDecode(read_buffer_, true);
+
   if (status == Network::FilterStatus::StopIteration) {
-    sequence_id_offset_++;
+    // FIXME: 必要なぶんだけDrainできないか検討
     data.drain(data.length());
-    decoder_->getSession().incUpstreamDrained();
+    getSession().incUpstreamDrained();
     return status;
   }
 
-  uint64_t remaining = data.length();
-  printf("-------------remain %ld\n", remaining);
-  while (remaining > 0) {
-    uint32_t len = 0;
-    uint8_t seq = 0;
-
-    BufferHelper::peekHdr(data, len, seq);
-    BufferHelper::consumeHdr(data);
-    remaining -= 4;
-
-    BufferHelper::addUint24(data, len);
-    BufferHelper::addUint8(data, seq - sequence_id_offset_);
-    //printf("---------------on data offset: %d, seq: %d\n", sequence_id_offset_, seq);
-
-    if (config_->terminate_ssl_ && current_state == MySQLSession::State::ChallengeReq){
-      uint32_t client_cap = 0;
-      BufferHelper::readUint32(data, client_cap);
-      remaining -= 4;
-      len -= 4;
-      BufferHelper::addUint32(data, client_cap ^ CLIENT_SSL);
-    }
-
-    std::string payload;
-    payload.reserve(len);
-    BufferHelper::readStringBySize(data, len, payload);
-    remaining -= len;
-    BufferHelper::addBytes(data, payload.c_str(), payload.size());
+  if (config_->terminate_ssl_) {
+    doRewrite(data, true);
   }
 
-  printf("---------------on data end\n");
   return status;
 }
 
 Network::FilterStatus MySQLFilter::onWrite(Buffer::Instance& data, bool) {
-  // Safety measure just to make sure that if we have a decoding error we keep going and lose stats.
-  // This can be removed once we are more confident of this code.
-  printf("---------------on write\n");
   Network::FilterStatus status = Network::FilterStatus::Continue;
 
-  if (sniffing_) {
-    write_buffer_.add(data);
-    status = doDecode(write_buffer_, false);
-
-    if (status == Network::FilterStatus::StopIteration) {
-      sequence_id_offset_--;
-      data.drain(data.length());
-      decoder_->getSession().incDownstreamDrained();
-      return status;
-    }
+  // Safety measure just to make sure that if we have a decoding error we keep going and lose stats.
+  // This can be removed once we are more confident of this code.
+  if (!sniffing_) {
+    return status;
   }
 
-  uint64_t remaining = data.length();
-  while (remaining > 0) {
-    uint32_t len = 0;
-    uint8_t seq = 0;
+  write_buffer_.add(data);
+  status = doDecode(write_buffer_, false);
 
-    BufferHelper::peekHdr(data, len, seq);
-    BufferHelper::addUint24(data, len);
-    BufferHelper::addUint8(data, seq + sequence_id_offset_);
-    printf("---------------on write offset: %d, seq: %d\n", sequence_id_offset_, seq);
-
-    BufferHelper::consumeHdr(data);
-    remaining -= 4;
-
-    std::string payload;
-    payload.reserve(len);
-    BufferHelper::readStringBySize(data, len, payload);
-    remaining -= len;
-    BufferHelper::addBytes(data, payload.c_str(), payload.size());
+  if (status == Network::FilterStatus::StopIteration) {
+    // FIXME: 必要なぶんだけDrainできないか検討
+    data.drain(data.length());
+    getSession().incDownstreamDrained();
+    return status;
   }
 
-  printf("---------------on write end\n");
+  if (config_->terminate_ssl_) {
+    doRewrite(data, false);
+  }
+
   return status;
 }
 
@@ -176,6 +129,33 @@ Network::FilterStatus MySQLFilter::doDecode(Buffer::Instance& buffer, bool is_up
 
 DecoderPtr MySQLFilter::createDecoder(DecoderCallbacks& callbacks) {
   return std::make_unique<DecoderImpl>(callbacks);
+}
+
+void MySQLFilter::doRewrite(Buffer::Instance& data, bool is_upstream) {
+  MySQLSession::State state = getSession().getState();
+
+  for (auto& payload_metadata : getSession().getPayloadMetadataList()) {
+    // FIXME: このままだとバグるのでZero-copyにする
+    uint8_t seq = payload_metadata.seq;
+    uint32_t len = payload_metadata.len;
+
+    BufferHelper::consumeHdr(data);
+
+    BufferHelper::addUint24(data, len);
+    BufferHelper::addUint8(data, seq);
+
+    if (is_upstream && (state == MySQLSession::State::ChallengeResp41 || state == MySQLSession::State::ChallengeResp320)){
+      uint32_t client_cap = 0;
+      BufferHelper::readUint32(data, client_cap);
+      len -= 4;
+      BufferHelper::addUint32(data, client_cap ^ (client_cap & CLIENT_SSL));
+    }
+
+    std::string payload;
+    payload.reserve(len);
+    BufferHelper::readStringBySize(data, len, payload);
+    BufferHelper::addBytes(data, payload.c_str(), payload.size());
+  }
 }
 
 void MySQLFilter::onProtocolError() { config_->stats_.protocol_errors_.inc(); }
