@@ -49,12 +49,13 @@ struct MySQLProxyStats {
  */
 class MySQLFilterConfig {
 public:
-  MySQLFilterConfig(const std::string& stat_prefix, Stats::Scope& scope);
+  MySQLFilterConfig(const std::string& stat_prefix, Stats::Scope& scope, bool terminate_ssl);
 
   const MySQLProxyStats& stats() { return stats_; }
 
   Stats::Scope& scope_;
   MySQLProxyStats stats_;
+  bool terminate_ssl_;
 
 private:
   MySQLProxyStats generateStats(const std::string& prefix, Stats::Scope& scope) {
@@ -82,17 +83,18 @@ public:
 
   // MySQLProxy::DecoderCallback
   void onProtocolError() override;
-  void onNewMessage(MySQLSession::State state) override;
   void onServerGreeting(ServerGreeting&) override{};
-  void onClientLogin(ClientLogin& message) override;
+  void onClientLogin(ClientLogin& message, MySQLSession::State state) override;
   void onClientLoginResponse(ClientLoginResponse& message) override;
   void onClientSwitchResponse(ClientSwitchResponse&) override{};
   void onMoreClientLoginResponse(ClientLoginResponse& message) override;
   void onCommand(Command& message) override;
   void onCommandResponse(CommandResponse&) override{};
+  bool onSSLRequest() override;
 
-  void doDecode(Buffer::Instance& buffer);
+  Network::FilterStatus doDecode(Buffer::Instance& buffer, bool is_upstream);
   DecoderPtr createDecoder(DecoderCallbacks& callbacks);
+  void doRewrite(Buffer::Instance& buffer, uint64_t remaining, bool is_upstream);
   MySQLSession& getSession() { return decoder_->getSession(); }
 
 private:
