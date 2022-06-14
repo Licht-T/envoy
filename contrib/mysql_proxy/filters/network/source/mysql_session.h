@@ -34,6 +34,7 @@ public:
   MySQLSession::State getState() { return state_; }
   uint8_t getExpectedSeq(bool is_upstream) { return seq_ - (is_upstream ? downstream_drained_ : upstream_drained_); }
   uint8_t getExpectedSeqForReciever(bool is_upstream) { return seq_ - (is_upstream ? upstream_drained_ : downstream_drained_); }
+  uint8_t convertToSeqOnReciever(uint8_t seq, bool is_upstream) { return seq + (is_upstream ? 1 : -1) * (downstream_drained_ - upstream_drained_); }
   void resetSeq() { seq_ = MYSQL_REQUEST_PKT_NUM; upstream_drained_ = 0; downstream_drained_ = 0; }
   void incSeq() { seq_++; }
   void incUpstreamDrained() { upstream_drained_++; }

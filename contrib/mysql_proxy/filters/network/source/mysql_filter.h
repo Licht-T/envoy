@@ -95,7 +95,7 @@ public:
 
   Network::FilterStatus doDecode(Buffer::Instance& buffer, bool is_upstream);
   DecoderPtr createDecoder(DecoderCallbacks& callbacks);
-  void doRewrite(Buffer::Instance& buffer, bool is_upstream);
+  void doRewrite(Buffer::Instance& buffer, uint64_t remaining, bool is_upstream);
   MySQLSession& getSession() { return decoder_->getSession(); }
 
 private:

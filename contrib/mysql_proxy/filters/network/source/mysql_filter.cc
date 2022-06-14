@@ -1,3 +1,5 @@
+#include <algorithm>
+
 #include "contrib/mysql_proxy/filters/network/source/mysql_filter.h"
 
 #include "envoy/config/core/v3/base.pb.h"
@@ -30,6 +32,7 @@ void MySQLFilter::initializeReadFilterCallbacks(Network::ReadFilterCallbacks& ca
 
 Network::FilterStatus MySQLFilter::onData(Buffer::Instance& data, bool) {
   Network::FilterStatus status = Network::FilterStatus::Continue;
+  uint64_t remaining = read_buffer_.length();
 
   // Safety measure just to make sure that if we have a decoding error we keep going and lose stats.
   // This can be removed once we are more confident of this code.
@@ -48,7 +51,7 @@ Network::FilterStatus MySQLFilter::onData(Buffer::Instance& data, bool) {
   }
 
   if (config_->terminate_ssl_) {
-    doRewrite(data, true);
+    doRewrite(data, remaining, true);
   }
 
   return status;
@@ -56,6 +59,7 @@ Network::FilterStatus MySQLFilter::onData(Buffer::Instance& data, bool) {
 
 Network::FilterStatus MySQLFilter::onWrite(Buffer::Instance& data, bool) {
   Network::FilterStatus status = Network::FilterStatus::Continue;
+  uint64_t remaining = write_buffer_.length();
 
   // Safety measure just to make sure that if we have a decoding error we keep going and lose stats.
   // This can be removed once we are more confident of this code.
@@ -74,7 +78,7 @@ Network::FilterStatus MySQLFilter::onWrite(Buffer::Instance& data, bool) {
   }
 
   if (config_->terminate_ssl_) {
-    doRewrite(data, false);
+    doRewrite(data, remaining, false);
   }
 
   return status;
@@ -131,30 +135,38 @@ DecoderPtr MySQLFilter::createDecoder(DecoderCallbacks& callbacks) {
   return std::make_unique<DecoderImpl>(callbacks);
 }
 
-void MySQLFilter::doRewrite(Buffer::Instance& data, bool is_upstream) {
+void MySQLFilter::doRewrite(Buffer::Instance& data, uint64_t remaining, bool is_upstream) {
   MySQLSession::State state = getSession().getState();
+  auto& payload_metadata_list = getSession().getPayloadMetadataList();
+  uint64_t max_data_size = data.length();
 
-  for (auto& payload_metadata : getSession().getPayloadMetadataList()) {
-    // FIXME: このままだとバグるのでZero-copyにする
-    uint8_t seq = payload_metadata.seq;
-    uint32_t len = payload_metadata.len;
+  for (size_t i = 0; i < payload_metadata_list.size(); ++i) {
+    uint8_t seq = payload_metadata_list[i].seq;
+    uint32_t len = payload_metadata_list[i].len;
 
-    BufferHelper::consumeHdr(data);
+    if (i == 0 && remaining > 0) {
+      len -= remaining - 4;
+    } else {
+      BufferHelper::consumeHdr(data);
+      max_data_size -= 4;
 
-    BufferHelper::addUint24(data, len);
-    BufferHelper::addUint8(data, seq);
+      BufferHelper::addUint24(data, len);
+      BufferHelper::addUint8(data, seq);
 
-    if (is_upstream && (state == MySQLSession::State::ChallengeResp41 || state == MySQLSession::State::ChallengeResp320)){
-      uint32_t client_cap = 0;
-      BufferHelper::readUint32(data, client_cap);
-      len -= 4;
-      BufferHelper::addUint32(data, client_cap ^ (client_cap & CLIENT_SSL));
+      if (is_upstream && (state == MySQLSession::State::ChallengeResp41 || state == MySQLSession::State::ChallengeResp320)){
+        uint32_t client_cap = 0;
+        BufferHelper::readUint32(data, client_cap);
+        len -= 4;
+        BufferHelper::addUint32(data, client_cap ^ (client_cap & CLIENT_SSL));
+      }
     }
 
     std::string payload;
-    payload.reserve(len);
-    BufferHelper::readStringBySize(data, len, payload);
+    uint64_t copy_size = std::min(static_cast<uint64_t>(len), max_data_size);
+    payload.reserve(copy_size);
+    BufferHelper::readStringBySize(data, copy_size, payload);
     BufferHelper::addBytes(data, payload.c_str(), payload.size());
+    max_data_size -= copy_size;
   }
 }
 

@@ -171,26 +171,28 @@ bool DecoderImpl::decode(Buffer::Instance& data, bool is_upstream) {
   ENVOY_LOG(trace, "mysql_proxy: decoding {} bytes", data.length());
   uint32_t len = 0;
   uint8_t seq = 0;
+  bool return_without_parse = false;
+  bool result = true;
+
+  auto current_state = session_.getState();
 
   // ignore ssl message
-  if (session_.getState() == MySQLSession::State::SslPt) {
+  if (current_state == MySQLSession::State::SslPt) {
     data.drain(data.length());
-    return true;
+    return result;
   }
 
   if (BufferHelper::peekHdr(data, len, seq) != DecodeStatus::Success) {
     throw EnvoyException("error parsing mysql packet header");
   }
   ENVOY_LOG(trace, "mysql_proxy: seq {}, len {}", seq, len);
+
   // If message is split over multiple packets, hold off until the entire message is available.
   // Consider the size of the header here as it's not consumed yet.
   if (sizeof(uint32_t) + len > data.length()) {
-    // FIXME: DrainせずにStopさせるか、Header rewrite対象にする
-    return false;
+    return_without_parse = true;
+    result = false;
   }
-
-  BufferHelper::consumeHdr(data); // Consume the header once the message is fully available.
-  callbacks_.onNewMessage(session_.getState());
 
   // Ignore duplicate and out-of-sync packets.
   if (seq != session_.getExpectedSeq(is_upstream)) {
@@ -198,25 +200,27 @@ bool DecoderImpl::decode(Buffer::Instance& data, bool is_upstream) {
     if (session_.getState() == MySQLSession::State::ReqResp && seq == MYSQL_REQUEST_PKT_NUM) {
       session_.resetSeq();
       session_.setState(MySQLSession::State::Req);
+      current_state = session_.getState();
     } else {
       ENVOY_LOG(info, "mysql_proxy: ignoring out-of-sync packet");
       callbacks_.onProtocolError();
       data.drain(len); // Ensure that the whole message was consumed
-      // FIXME: convertSeqOnRecieverを実装しておきかえる
-      session_.getPayloadMetadataList().push_back({
-        .seq=session_.getExpectedSeqForReciever(is_upstream),
-        .len=len
-      });
-      return true;
+      return_without_parse = true;
     }
   }
 
   session_.getPayloadMetadataList().push_back({
-    .seq=session_.getExpectedSeqForReciever(is_upstream),
+    .seq=session_.convertToSeqOnReciever(seq, is_upstream),
     .len=len
   });
 
+  if (return_without_parse) {
+    return result;
+  }
+
+  BufferHelper::consumeHdr(data); // Consume the header once the message is fully available.
   session_.incSeq();
+  callbacks_.onNewMessage(current_state);
 
   const ssize_t data_len = data.length();
   parseMessage(data, seq, len);
@@ -224,7 +228,7 @@ bool DecoderImpl::decode(Buffer::Instance& data, bool is_upstream) {
   data.drain(len - consumed_len); // Ensure that the whole message was consumed
 
   ENVOY_LOG(trace, "mysql_proxy: {} bytes remaining in buffer", data.length());
-  return true;
+  return result;
 }
 
 Decoder::Result DecoderImpl::onData(Buffer::Instance& data, bool is_upstream) {
