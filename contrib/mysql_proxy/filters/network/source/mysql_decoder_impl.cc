@@ -239,6 +239,7 @@ Decoder::Result DecoderImpl::onData(Buffer::Instance& data, bool is_upstream) {
 
   if (is_upstream && session_.getState() == MySQLSession::State::SslPt) {
     if (!callbacks_.onSSLRequest()) {
+      session_.setIsInSslAuth(true);
       session_.setState(MySQLSession::State::ChallengeReq);
       return Decoder::Result::Stopped;
     }

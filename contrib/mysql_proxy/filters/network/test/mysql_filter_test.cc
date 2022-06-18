@@ -390,7 +390,7 @@ TEST_F(MySQLFilterTest, MySqlHandshakeSSLPassThroughTest) {
 /**
  * Test MySQL Handshake with SSL Request
  * State-machine moves to SSL-Terminate
- * SM: greeting(p=10) -> challenge-req(v320) -> SSL_PT
+ * SM: greeting(p=10) -> challenge-req(v320) -> SSL_PT -> ChallengeReq -> Req -> ReqResp
  */
 TEST_F(MySQLFilterTest, MySqlHandshakeSSLTerminateTest) {
   initialize(true);
@@ -403,7 +403,7 @@ TEST_F(MySQLFilterTest, MySqlHandshakeSSLTerminateTest) {
   std::string greeting_data = encodeServerGreeting(MYSQL_PROTOCOL_10);
   Buffer::InstancePtr greet_data(new Buffer::OwnedImpl(greeting_data));
 
-  EXPECT_EQ(Envoy::Network::FilterStatus::Continue, filter_->onData(*greet_data, false));
+  EXPECT_EQ(Envoy::Network::FilterStatus::Continue, filter_->onWrite(*greet_data, false));
   EXPECT_EQ(MySQLSession::State::ChallengeReq, filter_->getSession().getState());
 
   std::string clogin_data = encodeClientLogin(CLIENT_SSL, "", CHALLENGE_SEQ_NUM);
@@ -423,9 +423,9 @@ TEST_F(MySQLFilterTest, MySqlHandshakeSSLTerminateTest) {
   EXPECT_EQ(1UL, config_->stats().login_attempts_.value());
   EXPECT_EQ(MySQLSession::State::ChallengeResp41, filter_->getSession().getState());
 
-  std::string srv_resp_data = encodeClientLoginResp(MYSQL_RESP_OK, 0, CHALLENGE_RESP_SEQ_NUM + 1);
+  std::string srv_resp_data = encodeClientLoginResp(MYSQL_RESP_OK, 0, CHALLENGE_RESP_SEQ_NUM);
   Buffer::InstancePtr server_resp_data(new Buffer::OwnedImpl(srv_resp_data));
-  EXPECT_EQ(Envoy::Network::FilterStatus::Continue, filter_->onData(*server_resp_data, false));
+  EXPECT_EQ(Envoy::Network::FilterStatus::Continue, filter_->onWrite(*server_resp_data, false));
   EXPECT_EQ(MySQLSession::State::Req, filter_->getSession().getState());
 
   Buffer::OwnedImpl query_create_index("!@#$encr$#@!");

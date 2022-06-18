@@ -45,7 +45,6 @@ Network::FilterStatus MySQLFilter::onData(Buffer::Instance& data, bool) {
 
   if (status == Network::FilterStatus::StopIteration) {
     data.drain(data.length());
-    getSession().incUpstreamDrained();
     return status;
   }
 
@@ -71,7 +70,6 @@ Network::FilterStatus MySQLFilter::onWrite(Buffer::Instance& data, bool) {
 
   if (status == Network::FilterStatus::StopIteration) {
     data.drain(data.length());
-    getSession().incDownstreamDrained();
     return status;
   }
 
