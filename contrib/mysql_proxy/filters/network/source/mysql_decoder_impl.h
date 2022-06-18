@@ -11,11 +11,11 @@ public:
   DecoderImpl(DecoderCallbacks& callbacks) : callbacks_(callbacks) {}
 
   // MySQLProxy::Decoder
-  void onData(Buffer::Instance& data) override;
+  Decoder::Result onData(Buffer::Instance& data, bool is_upstream) override;
   MySQLSession& getSession() override { return session_; }
 
 private:
-  bool decode(Buffer::Instance& data);
+  bool decode(Buffer::Instance& data, bool is_upstream);
   void parseMessage(Buffer::Instance& message, uint8_t seq, uint32_t len);
 
   DecoderCallbacks& callbacks_;
