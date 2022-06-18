@@ -372,6 +372,18 @@ TEST_F(MySQLFilterTest, MySqlHandshakeSSLTest) {
   client_login_data = Buffer::InstancePtr(new Buffer::OwnedImpl(clogin_data));
   EXPECT_EQ(Envoy::Network::FilterStatus::Continue, filter_->onData(*client_login_data, false));
   EXPECT_EQ(0UL, config_->stats().login_attempts_.value());
+  EXPECT_EQ(1UL, config_->stats().upgraded_to_ssl_.value());
+  EXPECT_EQ(MySQLSession::State::SslPt, filter_->getSession().getState());
+
+  std::string srv_resp_data = encodeClientLoginResp(MYSQL_RESP_OK, 0, CHALLENGE_RESP_SEQ_NUM + 1);
+  Buffer::InstancePtr server_resp_data(new Buffer::OwnedImpl(srv_resp_data));
+  EXPECT_EQ(Envoy::Network::FilterStatus::Continue, filter_->onData(*server_resp_data, false));
+  EXPECT_EQ(MySQLSession::State::SslPt, filter_->getSession().getState());
+
+  Buffer::OwnedImpl query_create_index("!@#$encr$#@!");
+  BufferHelper::encodeHdr(query_create_index, 0);
+  EXPECT_EQ(Envoy::Network::FilterStatus::Continue, filter_->onData(query_create_index, false));
+  EXPECT_EQ(MySQLSession::State::SslPt, filter_->getSession().getState());
 }
 
 /**
