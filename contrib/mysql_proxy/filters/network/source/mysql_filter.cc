@@ -74,15 +74,13 @@ DecoderPtr MySQLFilter::createDecoder(DecoderCallbacks& callbacks) {
 
 void MySQLFilter::onProtocolError() { config_->stats_.protocol_errors_.inc(); }
 
-void MySQLFilter::onNewMessage(MySQLSession::State state) {
-  if (state == MySQLSession::State::ChallengeReq) {
-    config_->stats_.login_attempts_.inc();
-  }
-}
-
-void MySQLFilter::onClientLogin(ClientLogin& client_login) {
+void MySQLFilter::onClientLogin(ClientLogin& client_login, MySQLSession::State state) {
   if (client_login.isSSLRequest()) {
     config_->stats_.upgraded_to_ssl_.inc();
+  }
+
+  if (state == MySQLSession::State::ChallengeResp41 || state == MySQLSession::State::ChallengeResp320) {
+    config_->stats_.login_attempts_.inc();
   }
 }
 

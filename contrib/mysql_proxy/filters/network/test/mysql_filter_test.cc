@@ -357,18 +357,21 @@ TEST_F(MySQLFilterTest, MySqlHandshakeSSLTest) {
   EXPECT_EQ(Envoy::Network::FilterStatus::Continue, filter_->onData(*greet_data, false));
   EXPECT_EQ(MySQLSession::State::ChallengeReq, filter_->getSession().getState());
 
-  std::string clogin_data =
-      encodeClientLogin(CLIENT_SSL | CLIENT_PROTOCOL_41, "user1", CHALLENGE_SEQ_NUM);
+  // Send SSL Connection Request packet.
+  // https://dev.mysql.com/doc/internals/en/ssl-handshake.html
+  std::string clogin_data = encodeClientLogin(CLIENT_SSL, "", CHALLENGE_SEQ_NUM);
   Buffer::InstancePtr client_login_data(new Buffer::OwnedImpl(clogin_data));
   EXPECT_EQ(Envoy::Network::FilterStatus::Continue, filter_->onData(*client_login_data, false));
-  EXPECT_EQ(1UL, config_->stats().login_attempts_.value());
+  EXPECT_EQ(0UL, config_->stats().login_attempts_.value());
   EXPECT_EQ(1UL, config_->stats().upgraded_to_ssl_.value());
   EXPECT_EQ(MySQLSession::State::SslPt, filter_->getSession().getState());
 
-  Buffer::OwnedImpl query_create_index("!@#$encr$#@!");
-  BufferHelper::encodeHdr(query_create_index, 2);
-  EXPECT_EQ(Envoy::Network::FilterStatus::Continue, filter_->onData(query_create_index, false));
-  EXPECT_EQ(MySQLSession::State::SslPt, filter_->getSession().getState());
+  // After SSL handshaking, attempt to login.
+  // Since the SSL-Pass-Through, # of login attempts is unknown.
+  clogin_data = encodeClientLogin(CLIENT_PROTOCOL_41, "user1", CHALLENGE_SEQ_NUM + 1);
+  client_login_data = Buffer::InstancePtr(new Buffer::OwnedImpl(clogin_data));
+  EXPECT_EQ(Envoy::Network::FilterStatus::Continue, filter_->onData(*client_login_data, false));
+  EXPECT_EQ(0UL, config_->stats().login_attempts_.value());
 }
 
 /**
@@ -687,12 +690,13 @@ TEST_F(MySQLFilterTest, MySqlHandshake41Ok2GreetTest) {
   Buffer::InstancePtr greet_data2(new Buffer::OwnedImpl(greeting_data2));
   EXPECT_EQ(Envoy::Network::FilterStatus::Continue, filter_->onData(*greet_data2, false));
   EXPECT_EQ(MySQLSession::State::ChallengeReq, filter_->getSession().getState());
+  EXPECT_EQ(0UL, config_->stats().login_attempts_.value());
   EXPECT_EQ(1UL, config_->stats().protocol_errors_.value());
 
   std::string clogin_data = encodeClientLogin(CLIENT_PROTOCOL_41, "user1", CHALLENGE_SEQ_NUM);
   Buffer::InstancePtr client_login_data(new Buffer::OwnedImpl(clogin_data));
   EXPECT_EQ(Envoy::Network::FilterStatus::Continue, filter_->onData(*client_login_data, false));
-  EXPECT_EQ(2UL, config_->stats().login_attempts_.value());
+  EXPECT_EQ(1UL, config_->stats().login_attempts_.value());
   EXPECT_EQ(MySQLSession::State::ChallengeResp41, filter_->getSession().getState());
 
   std::string srv_resp_data = encodeClientLoginResp(MYSQL_RESP_OK);

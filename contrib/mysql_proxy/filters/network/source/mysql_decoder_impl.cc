@@ -34,7 +34,7 @@ void DecoderImpl::parseMessage(Buffer::Instance& message, uint8_t seq, uint32_t 
     } else {
       session_.setState(MySQLSession::State::ChallengeResp320);
     }
-    callbacks_.onClientLogin(client_login);
+    callbacks_.onClientLogin(client_login, session_.getState());
     break;
   }
   case MySQLSession::State::SslPt:
@@ -187,7 +187,6 @@ bool DecoderImpl::decode(Buffer::Instance& data) {
   }
 
   BufferHelper::consumeHdr(data); // Consume the header once the message is fully available.
-  callbacks_.onNewMessage(session_.getState());
 
   // Ignore duplicate and out-of-sync packets.
   if (seq != session_.getExpectedSeq()) {

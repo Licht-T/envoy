@@ -82,9 +82,8 @@ public:
 
   // MySQLProxy::DecoderCallback
   void onProtocolError() override;
-  void onNewMessage(MySQLSession::State state) override;
   void onServerGreeting(ServerGreeting&) override{};
-  void onClientLogin(ClientLogin& message) override;
+  void onClientLogin(ClientLogin& message, MySQLSession::State state) override;
   void onClientLoginResponse(ClientLoginResponse& message) override;
   void onClientSwitchResponse(ClientSwitchResponse&) override{};
   void onMoreClientLoginResponse(ClientLoginResponse& message) override;
