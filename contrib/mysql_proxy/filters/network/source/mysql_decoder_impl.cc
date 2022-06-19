@@ -11,8 +11,8 @@ namespace Extensions {
 namespace NetworkFilters {
 namespace MySQLProxy {
 
-void DecoderImpl::parseMessage(Buffer::Instance& message, uint8_t seq, uint32_t len) {
-  ENVOY_LOG(trace, "mysql_proxy: parsing message, seq {}, len {}", seq, len);
+void DecoderImpl::parseMessage(Buffer::Instance& message, uint8_t seq, uint32_t len, bool is_upstream) {
+  ENVOY_LOG(trace, "mysql_proxy: parsing message, seq {}, len {}, is_upstream {}", seq, len, is_upstream);
   // Run the MySQL state machine
   switch (session_.getState()) {
   case MySQLSession::State::Init: {
@@ -49,6 +49,7 @@ void DecoderImpl::parseMessage(Buffer::Instance& message, uint8_t seq, uint32_t 
       session_.setState(MySQLSession::State::NotHandled);
       break;
     }
+    ENVOY_LOG(trace, "mysql_proxy: ChallengeResp resp_code is {}", resp_code);
     std::unique_ptr<ClientLoginResponse> msg;
     MySQLSession::State state = MySQLSession::State::NotHandled;
     switch (resp_code) {
@@ -71,6 +72,7 @@ void DecoderImpl::parseMessage(Buffer::Instance& message, uint8_t seq, uint32_t 
     }
     case MYSQL_RESP_MORE: {
       msg = std::make_unique<AuthMoreMessage>();
+      state = MySQLSession::State::AuthSwitchMore;
       break;
     }
     default:
@@ -93,7 +95,9 @@ void DecoderImpl::parseMessage(Buffer::Instance& message, uint8_t seq, uint32_t 
 
   case MySQLSession::State::AuthSwitchMore: {
     uint8_t resp_code;
-    if (BufferHelper::peekUint8(message, resp_code) != DecodeStatus::Success) {
+    if (is_upstream) {
+      break;
+    } else if (BufferHelper::peekUint8(message, resp_code) != DecodeStatus::Success) {
       session_.setState(MySQLSession::State::NotHandled);
       break;
     }
@@ -108,7 +112,7 @@ void DecoderImpl::parseMessage(Buffer::Instance& message, uint8_t seq, uint32_t 
     }
     case MYSQL_RESP_MORE: {
       msg = std::make_unique<AuthMoreMessage>();
-      state = MySQLSession::State::AuthSwitchResp;
+      state = MySQLSession::State::AuthSwitchMore;
       break;
     }
     case MYSQL_RESP_ERR: {
@@ -116,10 +120,6 @@ void DecoderImpl::parseMessage(Buffer::Instance& message, uint8_t seq, uint32_t 
       // stop parsing auth req/response, attempt to resync in command state
       state = MySQLSession::State::Resync;
       session_.resetSeq();
-      break;
-    }
-    case MYSQL_RESP_AUTH_SWITCH: {
-      msg = std::make_unique<AuthSwitchMessage>();
       break;
     }
     default:
@@ -221,7 +221,7 @@ bool DecoderImpl::decode(Buffer::Instance& data, bool is_upstream) {
   session_.incSeq();
 
   const ssize_t data_len = data.length();
-  parseMessage(data, seq, len);
+  parseMessage(data, seq, len, is_upstream);
   const ssize_t consumed_len = data_len - data.length();
   data.drain(len - consumed_len); // Ensure that the whole message was consumed
 

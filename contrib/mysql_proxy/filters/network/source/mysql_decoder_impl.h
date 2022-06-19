@@ -16,7 +16,7 @@ public:
 
 private:
   bool decode(Buffer::Instance& data, bool is_upstream);
-  void parseMessage(Buffer::Instance& message, uint8_t seq, uint32_t len);
+  void parseMessage(Buffer::Instance& message, uint8_t seq, uint32_t len, bool is_upstream);
 
   DecoderCallbacks& callbacks_;
   MySQLSession session_;
