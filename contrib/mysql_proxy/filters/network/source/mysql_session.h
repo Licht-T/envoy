@@ -27,12 +27,17 @@ public:
 
   void setState(MySQLSession::State state) { state_ = state; }
   MySQLSession::State getState() { return state_; }
-  uint8_t getExpectedSeq() { return expected_seq_; }
-  void setExpectedSeq(uint8_t seq) { expected_seq_ = seq; }
+  uint8_t getExpectedSeq(bool is_upstream) { return seq_ - (is_upstream ? 0 : is_in_ssl_auth_); }
+  uint8_t convertToSeqOnReciever(uint8_t seq, bool is_upstream) { return seq - (is_upstream ? 1 : -1) * is_in_ssl_auth_; }
+  void resetSeq() { seq_ = MYSQL_REQUEST_PKT_NUM; is_in_ssl_auth_ = false; }
+  void incSeq() { seq_++; }
+  bool isInSslAuth() const { return is_in_ssl_auth_; }
+  void setIsInSslAuth(bool is_in_ssl_auth) { is_in_ssl_auth_ = is_in_ssl_auth; }
 
 private:
   MySQLSession::State state_{State::Init};
-  uint8_t expected_seq_{0};
+  uint8_t seq_{0};
+  bool is_in_ssl_auth_{false};
 };
 
 } // namespace MySQLProxy

@@ -104,6 +104,8 @@ constexpr uint8_t LENENCODINT_8BYTES = 0xfe;
 constexpr uint32_t DEFAULT_MAX_PACKET_SIZE = (1 << 24) - 1; // 16M-1
 constexpr uint8_t MIN_PROTOCOL_VERSION = 10;
 
+constexpr uint32_t SSL_CONNECTION_REQUEST_PACKET_SIZE = 32;
+
 constexpr char MYSQL_STR_END = '\0';
 
 // error code
