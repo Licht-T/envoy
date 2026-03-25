@@ -406,9 +406,24 @@ public:
                                          bool enable_close_event) PURE;
 
   /**
+   * Add an accept socket to the worker. The accept socket manages async accept operations
+   * via io_uring on the listen socket FD.
+   * @param fd the listen socket file descriptor.
+   * @param cb callback invoked with FileReadyType::Read when an accepted connection is ready.
+   * @param num_inflight_accepts number of concurrent accept SQEs to keep in flight.
+   */
+  virtual IoUringSocket& addAcceptSocket(os_fd_t fd, Event::FileReadyCb cb,
+                                         uint32_t num_inflight_accepts) PURE;
+
+  /**
    * Return the current thread's dispatcher.
    */
   virtual Event::Dispatcher& dispatcher() PURE;
+
+  /**
+   * Submit an accept request for a socket.
+   */
+  virtual Request* submitAcceptRequest(IoUringSocket& socket) PURE;
 
   /**
    * Submit a connect request for a socket.

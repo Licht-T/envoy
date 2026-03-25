@@ -1,5 +1,7 @@
 #pragma once
 
+#include <queue>
+
 #include "envoy/common/io/io_uring.h"
 
 #include "source/common/buffer/buffer_impl.h"
@@ -25,6 +27,14 @@ public:
   std::unique_ptr<struct iovec[]> iov_;
 };
 
+class AcceptRequest : public Request {
+public:
+  AcceptRequest(IoUringSocket& socket);
+
+  struct sockaddr_storage remote_addr_ {};
+  socklen_t remote_addr_len_{sizeof(remote_addr_)};
+};
+
 class IoUringSocketEntry;
 using IoUringSocketEntryPtr = std::unique_ptr<IoUringSocketEntry>;
 
@@ -44,7 +54,10 @@ public:
                                  bool enable_close_event) override;
   IoUringSocket& addClientSocket(os_fd_t fd, Event::FileReadyCb cb,
                                  bool enable_close_event) override;
+  IoUringSocket& addAcceptSocket(os_fd_t fd, Event::FileReadyCb cb,
+                                 uint32_t num_inflight_accepts) override;
 
+  Request* submitAcceptRequest(IoUringSocket& socket) override;
   Request* submitConnectRequest(IoUringSocket& socket,
                                 const Network::Address::InstanceConstSharedPtr& address) override;
   Request* submitReadRequest(IoUringSocket& socket) override;
@@ -249,6 +262,49 @@ protected:
   void moveReadDataToBuffer(Request* req, size_t data_length);
   void onReadCompleted(int32_t result);
   void onWriteCompleted(int32_t result);
+};
+
+class IoUringAcceptSocket : public IoUringSocketEntry {
+public:
+  struct AcceptedConnection {
+    os_fd_t fd;
+    sockaddr_storage remote_addr;
+    socklen_t remote_addr_len;
+  };
+
+  IoUringAcceptSocket(os_fd_t fd, IoUringWorkerImpl& parent, Event::FileReadyCb cb,
+                      uint32_t num_inflight_accepts);
+
+  // IoUringSocket
+  void close(bool keep_fd_open, IoUringSocketOnClosedCb cb = nullptr) override;
+  void enableRead() override;
+  void disableRead() override;
+  void write(Buffer::Instance&) override { PANIC("not implemented"); }
+  uint64_t write(const Buffer::RawSlice*, uint64_t) override { PANIC("not implemented"); }
+  void shutdown(int) override { PANIC("not implemented"); }
+
+  void onAccept(Request* req, int32_t result, bool injected) override;
+  void onClose(Request* req, int32_t result, bool injected) override;
+  void onCancel(Request* req, int32_t result, bool injected) override;
+
+  bool hasPendingAccepts() const { return !pending_accepts_.empty(); }
+  AcceptedConnection popAcceptedConnection();
+
+private:
+  void submitAcceptRequests();
+  void closeInternal();
+
+  const uint32_t num_inflight_accepts_;
+  // Track in-flight accept requests for cancellation.
+  std::vector<Request*> accept_reqs_;
+  // Close request tracking.
+  Request* close_req_{nullptr};
+  // Whether we are draining accepts before close.
+  bool draining_{false};
+  // Whether to keep the fd open when closing.
+  bool keep_fd_open_{false};
+  // Queue of accepted connections ready for consumption.
+  std::queue<AcceptedConnection> pending_accepts_;
 };
 
 class IoUringClientSocket : public IoUringServerSocket {

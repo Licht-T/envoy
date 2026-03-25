@@ -37,10 +37,7 @@ IoUringSocketHandleImpl::~IoUringSocketHandleImpl() {
   // If the socket is owned by the main thread like a listener, it may outlive the IoUringWorker.
   // We have to ensure that the current thread has been registered and the io_uring in the thread
   // is still available.
-  // TODO(zhxie): for current usage of server socket and client socket, the check may be
-  // redundant.
   if (io_uring_socket_type_ != IoUringSocketType::Unknown &&
-      io_uring_socket_type_ != IoUringSocketType::Accept &&
       io_uring_worker_factory_.currentThreadRegistered() && io_uring_socket_.has_value()) {
     if (io_uring_socket_->getStatus() != Io::IoUringSocketStatus::Closed) {
       io_uring_socket_.ref().close(false);
@@ -57,15 +54,14 @@ Api::IoCallUint64Result IoUringSocketHandleImpl::close() {
 
   ASSERT(SOCKET_VALID(fd_));
 
-  if (io_uring_socket_type_ == IoUringSocketType::Unknown ||
-      io_uring_socket_type_ == IoUringSocketType::Accept || !io_uring_socket_.has_value()) {
+  if (io_uring_socket_.has_value()) {
+    io_uring_socket_.ref().close(false);
+    io_uring_socket_.reset();
+  } else {
     if (file_event_) {
       file_event_.reset();
     }
     ::close(fd_);
-  } else {
-    io_uring_socket_.ref().close(false);
-    io_uring_socket_.reset();
   }
   SET_SOCKET_INVALID(fd_);
   return Api::ioCallUint64ResultNoError();
@@ -186,6 +182,25 @@ IoHandlePtr IoUringSocketHandleImpl::accept(struct sockaddr* addr, socklen_t* ad
 
   ASSERT(io_uring_socket_type_ == IoUringSocketType::Accept);
 
+  // io_uring async accept path: pop from the pre-accepted connection queue.
+  if (io_uring_socket_.has_value()) {
+    auto* accept_socket =
+        dynamic_cast<Io::IoUringAcceptSocket*>(&io_uring_socket_.ref());
+    ASSERT(accept_socket != nullptr);
+    if (!accept_socket->hasPendingAccepts()) {
+      return nullptr;
+    }
+    auto conn = accept_socket->popAcceptedConnection();
+    if (addr != nullptr && addrlen != nullptr) {
+      socklen_t copy_len = std::min(*addrlen, conn.remote_addr_len);
+      memcpy(addr, &conn.remote_addr, copy_len);
+      *addrlen = conn.remote_addr_len;
+    }
+    return std::make_unique<IoUringSocketHandleImpl>(io_uring_worker_factory_, conn.fd,
+                                                     socket_v6only_, domain_, true);
+  }
+
+  // POSIX accept fallback path.
   Envoy::Api::SysCallSocketResult result =
       Api::OsSysCallsSingleton::get().accept(fd_, addr, addrlen);
   if (SOCKET_INVALID(result.return_value_)) {
@@ -277,7 +292,14 @@ void IoUringSocketHandleImpl::initializeFileEvent(Event::Dispatcher& dispatcher,
 
   switch (io_uring_socket_type_) {
   case IoUringSocketType::Accept:
-    file_event_ = dispatcher.createFileEvent(fd_, cb, trigger, events);
+    if (io_uring_worker_factory_.currentThreadRegistered()) {
+      // Use io_uring async accept on worker threads.
+      io_uring_socket_ = io_uring_worker_factory_.getIoUringWorker()->addAcceptSocket(
+          fd_, std::move(cb), /*num_inflight_accepts=*/4);
+    } else {
+      // Fallback to epoll-based accept for non-worker threads (e.g., admin listener).
+      file_event_ = dispatcher.createFileEvent(fd_, cb, trigger, events);
+    }
     break;
   case IoUringSocketType::Server:
     io_uring_socket_ = io_uring_worker_factory_.getIoUringWorker()->addServerSocket(
@@ -297,8 +319,15 @@ void IoUringSocketHandleImpl::activateFileEvents(uint32_t events) {
             ioUringSocketTypeStr());
 
   if (io_uring_socket_type_ == IoUringSocketType::Accept) {
-    ASSERT(file_event_ != nullptr);
-    file_event_->activate(events);
+    if (io_uring_socket_.has_value()) {
+      // For io_uring accept, inject a completion to trigger the accept callback.
+      if (events & Event::FileReadyType::Read) {
+        io_uring_socket_->injectCompletion(Io::Request::RequestType::Accept);
+      }
+    } else {
+      ASSERT(file_event_ != nullptr);
+      file_event_->activate(events);
+    }
     return;
   }
 
@@ -315,8 +344,16 @@ void IoUringSocketHandleImpl::enableFileEvents(uint32_t events) {
             ioUringSocketTypeStr());
 
   if (io_uring_socket_type_ == IoUringSocketType::Accept) {
-    ASSERT(file_event_ != nullptr);
-    file_event_->setEnabled(events);
+    if (io_uring_socket_.has_value()) {
+      if (events & Event::FileReadyType::Read) {
+        io_uring_socket_->enableRead();
+      } else {
+        io_uring_socket_->disableRead();
+      }
+    } else {
+      ASSERT(file_event_ != nullptr);
+      file_event_->setEnabled(events);
+    }
     return;
   }
 
@@ -332,7 +369,11 @@ void IoUringSocketHandleImpl::resetFileEvents() {
   ENVOY_LOG(trace, "reset file events, fd = {}, type = {}", fd_, ioUringSocketTypeStr());
 
   if (io_uring_socket_type_ == IoUringSocketType::Accept) {
-    file_event_.reset();
+    if (io_uring_socket_.has_value()) {
+      io_uring_socket_->disableRead();
+    } else {
+      file_event_.reset();
+    }
     return;
   }
 

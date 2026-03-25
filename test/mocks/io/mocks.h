@@ -68,7 +68,10 @@ public:
                bool enable_close_event));
   MOCK_METHOD(IoUringSocket&, addClientSocket,
               (os_fd_t fd, Event::FileReadyCb cb, bool enable_close_event));
+  MOCK_METHOD(IoUringSocket&, addAcceptSocket,
+              (os_fd_t fd, Event::FileReadyCb cb, uint32_t num_inflight_accepts));
   MOCK_METHOD(Event::Dispatcher&, dispatcher, ());
+  MOCK_METHOD(Request*, submitAcceptRequest, (IoUringSocket & socket));
   MOCK_METHOD(Request*, submitConnectRequest,
               (IoUringSocket & socket, const Network::Address::InstanceConstSharedPtr& address));
   MOCK_METHOD(Request*, submitReadRequest, (IoUringSocket & socket));

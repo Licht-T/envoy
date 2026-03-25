@@ -10,6 +10,8 @@ ReadRequest::ReadRequest(IoUringSocket& socket, uint32_t size)
   iov_->iov_len = size;
 }
 
+AcceptRequest::AcceptRequest(IoUringSocket& socket) : Request(RequestType::Accept, socket) {}
+
 WriteRequest::WriteRequest(IoUringSocket& socket, const Buffer::RawSliceVector& slices)
     : Request(RequestType::Write, socket), iov_(std::make_unique<struct iovec[]>(slices.size())) {
   for (size_t i = 0; i < slices.size(); i++) {
@@ -125,6 +127,33 @@ IoUringSocket& IoUringWorkerImpl::addClientSocket(os_fd_t fd, Event::FileReadyCb
   std::unique_ptr<IoUringClientSocket> socket = std::make_unique<IoUringClientSocket>(
       fd, *this, std::move(cb), write_timeout_ms_, enable_close_event);
   return addSocket(std::move(socket));
+}
+
+IoUringSocket& IoUringWorkerImpl::addAcceptSocket(os_fd_t fd, Event::FileReadyCb cb,
+                                                   uint32_t num_inflight_accepts) {
+  ENVOY_LOG(trace, "add accept socket, fd = {}", fd);
+  auto socket =
+      std::make_unique<IoUringAcceptSocket>(fd, *this, std::move(cb), num_inflight_accepts);
+  return addSocket(std::move(socket));
+}
+
+Request* IoUringWorkerImpl::submitAcceptRequest(IoUringSocket& socket) {
+  auto* req = new AcceptRequest(socket);
+
+  ENVOY_LOG(trace, "submit accept request, fd = {}, req = {}", socket.fd(), fmt::ptr(req));
+
+  auto res = io_uring_->prepareAccept(socket.fd(),
+                                       reinterpret_cast<struct sockaddr*>(&req->remote_addr_),
+                                       &req->remote_addr_len_, req);
+  if (res == IoUringResult::Failed) {
+    submit();
+    res = io_uring_->prepareAccept(socket.fd(),
+                                    reinterpret_cast<struct sockaddr*>(&req->remote_addr_),
+                                    &req->remote_addr_len_, req);
+    RELEASE_ASSERT(res == IoUringResult::Ok, "unable to prepare accept");
+  }
+  submit();
+  return req;
 }
 
 Event::Dispatcher& IoUringWorkerImpl::dispatcher() { return dispatcher_; }
@@ -676,6 +705,136 @@ void IoUringClientSocket::onConnect(Request* req, int32_t result, bool injected)
   // Calls parent injectCompletion() directly since we want to send connect result back to the IO
   // handle.
   parent_.injectCompletion(*this, Request::RequestType::Write, result);
+}
+
+IoUringAcceptSocket::IoUringAcceptSocket(os_fd_t fd, IoUringWorkerImpl& parent,
+                                         Event::FileReadyCb cb, uint32_t num_inflight_accepts)
+    : IoUringSocketEntry(fd, parent, std::move(cb), false),
+      num_inflight_accepts_(num_inflight_accepts) {}
+
+IoUringAcceptSocket::AcceptedConnection IoUringAcceptSocket::popAcceptedConnection() {
+  ASSERT(!pending_accepts_.empty());
+  AcceptedConnection conn = std::move(pending_accepts_.front());
+  pending_accepts_.pop();
+  return conn;
+}
+
+void IoUringAcceptSocket::enableRead() {
+  IoUringSocketEntry::enableRead();
+  ENVOY_LOG(trace, "accept socket enable read, fd = {}", fd_);
+  submitAcceptRequests();
+}
+
+void IoUringAcceptSocket::disableRead() {
+  IoUringSocketEntry::disableRead();
+  ENVOY_LOG(trace, "accept socket disable read, fd = {}", fd_);
+  // Don't cancel in-flight accepts. They are harmless — completed accepts will be
+  // closed if not consumed. We simply stop submitting new ones.
+}
+
+void IoUringAcceptSocket::close(bool keep_fd_open, IoUringSocketOnClosedCb cb) {
+  ENVOY_LOG(trace, "accept socket close, fd = {}, status = {}", fd_, static_cast<int>(status_));
+
+  IoUringSocketEntry::close(keep_fd_open, cb);
+  keep_fd_open_ = keep_fd_open;
+  draining_ = true;
+
+  // Close any pending accepted FDs that haven't been consumed.
+  while (!pending_accepts_.empty()) {
+    auto conn = pending_accepts_.front();
+    pending_accepts_.pop();
+    ::close(conn.fd);
+  }
+
+  // Cancel all in-flight accept requests.
+  if (accept_reqs_.empty()) {
+    closeInternal();
+    return;
+  }
+
+  for (auto* req : accept_reqs_) {
+    ENVOY_LOG(trace, "cancel accept request, fd = {}, req = {}", fd_, fmt::ptr(req));
+    parent_.submitCancelRequest(*this, req);
+  }
+}
+
+void IoUringAcceptSocket::onAccept(Request* req, int32_t result, bool injected) {
+  IoUringSocketEntry::onAccept(req, result, injected);
+
+  ENVOY_LOG(trace, "accept socket onAccept, fd = {}, result = {}, injected = {}, draining = {}",
+            fd_, result, injected, draining_);
+
+  // Remove the completed request from tracking.
+  auto it = std::find(accept_reqs_.begin(), accept_reqs_.end(), req);
+  if (it != accept_reqs_.end()) {
+    accept_reqs_.erase(it);
+  }
+
+  if (result >= 0) {
+    if (draining_ || status_ == Closed) {
+      // We are closing — don't deliver, just close the accepted FD.
+      ::close(result);
+    } else {
+      // Copy addr from the AcceptRequest before it's deleted by onFileEvent().
+      auto* accept_req = static_cast<AcceptRequest*>(req);
+      AcceptedConnection conn;
+      conn.fd = result;
+      conn.remote_addr = accept_req->remote_addr_;
+      conn.remote_addr_len = accept_req->remote_addr_len_;
+      pending_accepts_.push(std::move(conn));
+
+      // Notify the listener that there is an accepted connection ready.
+      THROW_IF_NOT_OK(cb_(Event::FileReadyType::Read));
+    }
+  } else if (result != -ECANCELED) {
+    ENVOY_LOG(warn, "accept socket onAccept error, fd = {}, result = {}", fd_, result);
+  }
+
+  if (draining_) {
+    if (accept_reqs_.empty()) {
+      closeInternal();
+    }
+    return;
+  }
+
+  // Submit a replacement accept request if still enabled.
+  if (status_ == ReadEnabled) {
+    submitAcceptRequests();
+  }
+}
+
+void IoUringAcceptSocket::onClose(Request* req, int32_t result, bool injected) {
+  IoUringSocketEntry::onClose(req, result, injected);
+  ASSERT(!injected);
+  cleanup();
+}
+
+void IoUringAcceptSocket::onCancel(Request* req, int32_t result, bool injected) {
+  IoUringSocketEntry::onCancel(req, result, injected);
+  ASSERT(!injected);
+  // Cancel completions don't need special tracking — the corresponding accept CQE
+  // (with -ECANCELED) handles the request cleanup in onAccept().
+}
+
+void IoUringAcceptSocket::submitAcceptRequests() {
+  while (accept_reqs_.size() < num_inflight_accepts_ && !draining_) {
+    auto* req = parent_.submitAcceptRequest(*this);
+    accept_reqs_.push_back(req);
+  }
+}
+
+void IoUringAcceptSocket::closeInternal() {
+  if (keep_fd_open_) {
+    if (on_closed_cb_) {
+      Buffer::OwnedImpl empty_buf;
+      on_closed_cb_(empty_buf);
+    }
+    cleanup();
+    return;
+  }
+  if (close_req_ == nullptr) {
+    close_req_ = parent_.submitCloseRequest(*this);
+  }
 }
 
 } // namespace Io

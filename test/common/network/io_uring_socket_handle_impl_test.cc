@@ -132,6 +132,81 @@ TEST_F(IoUringSocketHandleTest, RecvmmsgNotSupported) {
               Api::IoError::IoErrorCode::NoSupport);
 }
 
+// ============================================================================
+// Accept socket handle tests
+// ============================================================================
+
+TEST_F(IoUringSocketHandleTest, AcceptInitializeFileEventWithWorker) {
+  IoUringSocketHandleTestImpl impl(factory_, false);
+  // listen() sets type to Accept, uses POSIX listen internally (will fail on INVALID_SOCKET
+  // but the type is still set).
+  EXPECT_CALL(factory_, currentThreadRegistered()).WillOnce(testing::Return(true));
+  EXPECT_CALL(factory_, getIoUringWorker())
+      .WillOnce(testing::Return(OptRef<Io::IoUringWorker>(worker_)));
+  EXPECT_CALL(worker_, addAcceptSocket(_, _, 4)).WillOnce(testing::ReturnRef(socket_));
+  impl.listen(5);
+  EXPECT_EQ(IoUringSocketType::Accept, impl.ioUringSocketType());
+
+  impl.initializeFileEvent(
+      dispatcher_, [](uint32_t) { return absl::OkStatus(); }, Event::PlatformDefaultTriggerType,
+      Event::FileReadyType::Read);
+
+  // enableFileEvents should delegate to io_uring socket.
+  EXPECT_CALL(socket_, enableRead());
+  impl.enableFileEvents(Event::FileReadyType::Read);
+
+  EXPECT_CALL(socket_, disableRead());
+  impl.enableFileEvents(0);
+
+  // Destructor will handle cleanup (fd is INVALID_SOCKET so it skips close).
+}
+
+TEST_F(IoUringSocketHandleTest, AcceptInitializeFileEventFallback) {
+  IoUringSocketHandleTestImpl impl(factory_, false);
+  // Not registered on worker thread — should fall back to file event.
+  EXPECT_CALL(factory_, currentThreadRegistered()).WillOnce(testing::Return(false));
+  impl.listen(5);
+  EXPECT_EQ(IoUringSocketType::Accept, impl.ioUringSocketType());
+
+  EXPECT_CALL(dispatcher_, createFileEvent_(_, _, _, _))
+      .WillOnce(testing::ReturnNew<testing::NiceMock<Event::MockFileEvent>>());
+  impl.initializeFileEvent(
+      dispatcher_, [](uint32_t) { return absl::OkStatus(); }, Event::PlatformDefaultTriggerType,
+      Event::FileReadyType::Read);
+
+  // Destructor handles cleanup (fd is INVALID_SOCKET).
+}
+
+TEST_F(IoUringSocketHandleTest, AcceptEnableDisableFileEvents) {
+  IoUringSocketHandleTestImpl impl(factory_, false);
+  EXPECT_CALL(factory_, currentThreadRegistered()).WillOnce(testing::Return(true));
+  EXPECT_CALL(factory_, getIoUringWorker())
+      .WillOnce(testing::Return(OptRef<Io::IoUringWorker>(worker_)));
+  EXPECT_CALL(worker_, addAcceptSocket(_, _, 4)).WillOnce(testing::ReturnRef(socket_));
+  impl.listen(5);
+  impl.initializeFileEvent(
+      dispatcher_, [](uint32_t) { return absl::OkStatus(); }, Event::PlatformDefaultTriggerType,
+      Event::FileReadyType::Read);
+
+  // enableFileEvents with Read → enableRead.
+  EXPECT_CALL(socket_, enableRead());
+  impl.enableFileEvents(Event::FileReadyType::Read);
+
+  // enableFileEvents with 0 → disableRead.
+  EXPECT_CALL(socket_, disableRead());
+  impl.enableFileEvents(0);
+
+  // activateFileEvents with Read → injectCompletion.
+  EXPECT_CALL(socket_, injectCompletion(Io::Request::RequestType::Accept));
+  impl.activateFileEvents(Event::FileReadyType::Read);
+
+  // resetFileEvents → disableRead.
+  EXPECT_CALL(socket_, disableRead());
+  impl.resetFileEvents();
+
+  // Destructor handles cleanup (fd is INVALID_SOCKET).
+}
+
 } // namespace
 } // namespace Network
 } // namespace Envoy

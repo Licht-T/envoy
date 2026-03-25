@@ -971,6 +971,294 @@ TEST_F(IoUringWorkerIntegrationTest, ClientSocketConnectError) {
   cleanup();
 }
 
+// ============================================================================
+// IoUringAcceptSocket integration tests
+// ============================================================================
+
+TEST_F(IoUringWorkerIntegrationTest, AcceptSocketRealAccept) {
+  initialize();
+
+  // Create a listen socket.
+  listen_socket_ =
+      Api::OsSysCallsSingleton::get()
+          .socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP)
+          .return_value_;
+  EXPECT_TRUE(SOCKET_VALID(listen_socket_));
+
+  struct sockaddr_in listen_addr;
+  memset(&listen_addr, 0, sizeof(listen_addr));
+  listen_addr.sin_family = AF_INET;
+  listen_addr.sin_port = 0;
+  EXPECT_EQ(inet_pton(AF_INET, "127.0.0.1", &listen_addr.sin_addr.s_addr), 1);
+  EXPECT_EQ(Api::OsSysCallsSingleton::get()
+                .bind(listen_socket_, reinterpret_cast<struct sockaddr*>(&listen_addr),
+                      sizeof(listen_addr))
+                .return_value_,
+            0);
+  EXPECT_EQ(Api::OsSysCallsSingleton::get().listen(listen_socket_, 5).return_value_, 0);
+
+  // Add accept socket via io_uring.
+  os_fd_t accepted_fd = INVALID_SOCKET;
+  auto& accept_socket = io_uring_worker_->addAcceptSocket(
+      listen_socket_,
+      [](uint32_t events) {
+        EXPECT_EQ(events, Event::FileReadyType::Read);
+        return absl::OkStatus();
+      },
+      2);
+  accept_socket.enableRead();
+
+  // Create a client socket and connect.
+  client_socket_ =
+      Api::OsSysCallsSingleton::get()
+          .socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP)
+          .return_value_;
+  EXPECT_TRUE(SOCKET_VALID(client_socket_));
+
+  struct sockaddr_in sin = getListenSocketAddress();
+  Api::OsSysCallsSingleton::get().connect(client_socket_,
+                                          reinterpret_cast<struct sockaddr*>(&sin), sizeof(sin));
+
+  // Wait for accept to complete.
+  auto* accept_socket_ptr = dynamic_cast<IoUringAcceptSocket*>(&accept_socket);
+  ASSERT_NE(accept_socket_ptr, nullptr);
+  while (!accept_socket_ptr->hasPendingAccepts()) {
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  }
+
+  // Pop the accepted connection and verify the FD is valid.
+  auto conn = accept_socket_ptr->popAcceptedConnection();
+  accepted_fd = conn.fd;
+  EXPECT_TRUE(SOCKET_VALID(accepted_fd));
+
+  // Verify we can communicate on the accepted FD.
+  const char* msg = "hello";
+  EXPECT_EQ(::send(client_socket_, msg, 5, 0), 5);
+  char buf[16] = {};
+  // Make accepted fd blocking for simple recv.
+  int flags = fcntl(accepted_fd, F_GETFL);
+  fcntl(accepted_fd, F_SETFL, flags & ~O_NONBLOCK);
+  EXPECT_EQ(::recv(accepted_fd, buf, sizeof(buf), 0), 5);
+  EXPECT_STREQ(buf, "hello");
+
+  // Cleanup.
+  ::close(accepted_fd);
+  accept_socket.close(false);
+  runToClose(listen_socket_);
+  Api::OsSysCallsSingleton::get().close(client_socket_);
+  EXPECT_EQ(io_uring_worker_->getSockets().size(), 0);
+}
+
+TEST_F(IoUringWorkerIntegrationTest, AcceptSocketMultipleClients) {
+  initialize();
+
+  // Create a listen socket.
+  listen_socket_ =
+      Api::OsSysCallsSingleton::get()
+          .socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP)
+          .return_value_;
+  EXPECT_TRUE(SOCKET_VALID(listen_socket_));
+
+  struct sockaddr_in listen_addr;
+  memset(&listen_addr, 0, sizeof(listen_addr));
+  listen_addr.sin_family = AF_INET;
+  listen_addr.sin_port = 0;
+  EXPECT_EQ(inet_pton(AF_INET, "127.0.0.1", &listen_addr.sin_addr.s_addr), 1);
+  EXPECT_EQ(Api::OsSysCallsSingleton::get()
+                .bind(listen_socket_, reinterpret_cast<struct sockaddr*>(&listen_addr),
+                      sizeof(listen_addr))
+                .return_value_,
+            0);
+  EXPECT_EQ(Api::OsSysCallsSingleton::get().listen(listen_socket_, 5).return_value_, 0);
+
+  // Add accept socket.
+  auto& accept_socket = io_uring_worker_->addAcceptSocket(
+      listen_socket_, [](uint32_t) { return absl::OkStatus(); }, 4);
+  accept_socket.enableRead();
+  auto* accept_socket_ptr = dynamic_cast<IoUringAcceptSocket*>(&accept_socket);
+
+  // Connect 3 clients.
+  struct sockaddr_in sin = getListenSocketAddress();
+  std::vector<os_fd_t> client_sockets;
+  for (int i = 0; i < 3; i++) {
+    os_fd_t cs = Api::OsSysCallsSingleton::get()
+                     .socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP)
+                     .return_value_;
+    EXPECT_TRUE(SOCKET_VALID(cs));
+    Api::OsSysCallsSingleton::get().connect(cs, reinterpret_cast<struct sockaddr*>(&sin),
+                                            sizeof(sin));
+    client_sockets.push_back(cs);
+  }
+
+  // Wait for all 3 accepts.
+  std::vector<os_fd_t> accepted_fds;
+  while (accepted_fds.size() < 3) {
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+    while (accept_socket_ptr->hasPendingAccepts()) {
+      auto conn = accept_socket_ptr->popAcceptedConnection();
+      EXPECT_TRUE(SOCKET_VALID(conn.fd));
+      accepted_fds.push_back(conn.fd);
+    }
+  }
+  EXPECT_EQ(accepted_fds.size(), 3);
+
+  // Cleanup.
+  for (auto afd : accepted_fds) {
+    ::close(afd);
+  }
+  for (auto cs : client_sockets) {
+    Api::OsSysCallsSingleton::get().close(cs);
+  }
+  accept_socket.close(false);
+  runToClose(listen_socket_);
+  EXPECT_EQ(io_uring_worker_->getSockets().size(), 0);
+}
+
+// From original PR #24958: disable, verify no accept, re-enable, connect, verify accept.
+TEST_F(IoUringWorkerIntegrationTest, AcceptSocketDisableAndReEnable) {
+  initialize();
+
+  listen_socket_ =
+      Api::OsSysCallsSingleton::get()
+          .socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP)
+          .return_value_;
+  EXPECT_TRUE(SOCKET_VALID(listen_socket_));
+
+  struct sockaddr_in listen_addr;
+  memset(&listen_addr, 0, sizeof(listen_addr));
+  listen_addr.sin_family = AF_INET;
+  listen_addr.sin_port = 0;
+  EXPECT_EQ(inet_pton(AF_INET, "127.0.0.1", &listen_addr.sin_addr.s_addr), 1);
+  EXPECT_EQ(Api::OsSysCallsSingleton::get()
+                .bind(listen_socket_, reinterpret_cast<struct sockaddr*>(&listen_addr),
+                      sizeof(listen_addr))
+                .return_value_,
+            0);
+  EXPECT_EQ(Api::OsSysCallsSingleton::get().listen(listen_socket_, 5).return_value_, 0);
+
+  auto& accept_socket = io_uring_worker_->addAcceptSocket(
+      listen_socket_, [](uint32_t) { return absl::OkStatus(); }, 2);
+  accept_socket.enableRead();
+  auto* accept_socket_ptr = dynamic_cast<IoUringAcceptSocket*>(&accept_socket);
+
+  // Disable — stop accepting.
+  accept_socket.disableRead();
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  EXPECT_FALSE(accept_socket_ptr->hasPendingAccepts());
+
+  // Re-enable — should start accepting again.
+  accept_socket.enableRead();
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+
+  // Connect a client.
+  client_socket_ =
+      Api::OsSysCallsSingleton::get()
+          .socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP)
+          .return_value_;
+  EXPECT_TRUE(SOCKET_VALID(client_socket_));
+  struct sockaddr_in sin = getListenSocketAddress();
+  Api::OsSysCallsSingleton::get().connect(client_socket_,
+                                          reinterpret_cast<struct sockaddr*>(&sin), sizeof(sin));
+
+  // Wait for accept.
+  while (!accept_socket_ptr->hasPendingAccepts()) {
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  }
+
+  auto conn = accept_socket_ptr->popAcceptedConnection();
+  EXPECT_TRUE(SOCKET_VALID(conn.fd));
+  ::close(conn.fd);
+
+  accept_socket.close(false);
+  runToClose(listen_socket_);
+  Api::OsSysCallsSingleton::get().close(client_socket_);
+  EXPECT_EQ(io_uring_worker_->getSockets().size(), 0);
+}
+
+// From original PR #24958: close socket, then connect — accepted FD should not be delivered.
+TEST_F(IoUringWorkerIntegrationTest, AcceptSocketAcceptOnClosing) {
+  initialize();
+
+  listen_socket_ =
+      Api::OsSysCallsSingleton::get()
+          .socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP)
+          .return_value_;
+  EXPECT_TRUE(SOCKET_VALID(listen_socket_));
+
+  struct sockaddr_in listen_addr;
+  memset(&listen_addr, 0, sizeof(listen_addr));
+  listen_addr.sin_family = AF_INET;
+  listen_addr.sin_port = 0;
+  EXPECT_EQ(inet_pton(AF_INET, "127.0.0.1", &listen_addr.sin_addr.s_addr), 1);
+  EXPECT_EQ(Api::OsSysCallsSingleton::get()
+                .bind(listen_socket_, reinterpret_cast<struct sockaddr*>(&listen_addr),
+                      sizeof(listen_addr))
+                .return_value_,
+            0);
+  EXPECT_EQ(Api::OsSysCallsSingleton::get().listen(listen_socket_, 5).return_value_, 0);
+
+  bool cb_called = false;
+  auto& accept_socket = io_uring_worker_->addAcceptSocket(
+      listen_socket_, [&cb_called](uint32_t) { cb_called = true; return absl::OkStatus(); }, 2);
+  accept_socket.enableRead();
+
+  // Close the accept socket first, then connect.
+  accept_socket.close(false);
+
+  client_socket_ =
+      Api::OsSysCallsSingleton::get()
+          .socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP)
+          .return_value_;
+  EXPECT_TRUE(SOCKET_VALID(client_socket_));
+  struct sockaddr_in sin = getListenSocketAddress();
+  Api::OsSysCallsSingleton::get().connect(client_socket_,
+                                          reinterpret_cast<struct sockaddr*>(&sin), sizeof(sin));
+
+  // Run the event loop to drain everything.
+  runToClose(listen_socket_);
+
+  // The callback should NOT have been called — accept during drain is dropped.
+  EXPECT_FALSE(cb_called);
+  EXPECT_EQ(io_uring_worker_->getSockets().size(), 0);
+  Api::OsSysCallsSingleton::get().close(client_socket_);
+}
+
+TEST_F(IoUringWorkerIntegrationTest, AcceptSocketCloseWhileAccepting) {
+  initialize();
+
+  // Create a listen socket.
+  listen_socket_ =
+      Api::OsSysCallsSingleton::get()
+          .socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP)
+          .return_value_;
+  EXPECT_TRUE(SOCKET_VALID(listen_socket_));
+
+  struct sockaddr_in listen_addr;
+  memset(&listen_addr, 0, sizeof(listen_addr));
+  listen_addr.sin_family = AF_INET;
+  listen_addr.sin_port = 0;
+  EXPECT_EQ(inet_pton(AF_INET, "127.0.0.1", &listen_addr.sin_addr.s_addr), 1);
+  EXPECT_EQ(Api::OsSysCallsSingleton::get()
+                .bind(listen_socket_, reinterpret_cast<struct sockaddr*>(&listen_addr),
+                      sizeof(listen_addr))
+                .return_value_,
+            0);
+  EXPECT_EQ(Api::OsSysCallsSingleton::get().listen(listen_socket_, 5).return_value_, 0);
+
+  // Add accept socket with 4 in-flight accepts.
+  auto& accept_socket = io_uring_worker_->addAcceptSocket(
+      listen_socket_, [](uint32_t) { return absl::OkStatus(); }, 4);
+  accept_socket.enableRead();
+
+  // Run one iteration to ensure SQEs are submitted.
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+
+  // Close while 4 accept SQEs are in flight. Should cancel and drain cleanly.
+  accept_socket.close(false);
+  runToClose(listen_socket_);
+  EXPECT_EQ(io_uring_worker_->getSockets().size(), 0);
+}
+
 } // namespace
 } // namespace Io
 } // namespace Envoy

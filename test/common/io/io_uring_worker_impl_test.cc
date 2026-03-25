@@ -693,6 +693,472 @@ TEST(IoUringWorkerImplTest, NoEnableReadOnConnectError) {
   delete static_cast<Request*>(connect_req);
 }
 
+// ============================================================================
+// IoUringAcceptSocket tests
+// ============================================================================
+
+// Helper to set up a common accept socket test environment.
+// Creates MockIoUring, MockDispatcher, captures file_event_callback,
+// and creates an IoUringWorkerTestImpl.
+struct AcceptSocketTestSetup {
+  AcceptSocketTestSetup() {
+    io_uring_instance = std::make_unique<MockIoUring>();
+    mock_io_uring = dynamic_cast<MockIoUring*>(io_uring_instance.get());
+
+    EXPECT_CALL(*mock_io_uring, registerEventfd());
+    EXPECT_CALL(dispatcher,
+                createFileEvent_(_, _, Event::PlatformDefaultTriggerType,
+                                 Event::FileReadyType::Read))
+        .WillOnce(DoAll(SaveArg<1>(&file_event_callback),
+                        ReturnNew<NiceMock<Event::MockFileEvent>>()));
+    worker = std::make_unique<IoUringWorkerTestImpl>(std::move(io_uring_instance), dispatcher);
+  }
+
+  ~AcceptSocketTestSetup() {
+    EXPECT_CALL(dispatcher, clearDeferredDeleteList());
+  }
+
+  Event::MockDispatcher dispatcher;
+  IoUringPtr io_uring_instance;
+  MockIoUring* mock_io_uring;
+  Event::FileReadyCb file_event_callback;
+  std::unique_ptr<IoUringWorkerTestImpl> worker;
+};
+
+TEST(IoUringWorkerImplTest, AcceptSocketBasicLifecycle) {
+  AcceptSocketTestSetup setup;
+  auto& mock_io_uring = *setup.mock_io_uring;
+  auto& worker = *setup.worker;
+  auto& dispatcher = setup.dispatcher;
+
+  os_fd_t fd = 11;
+  SET_SOCKET_INVALID(fd);
+
+  // addAcceptSocket should not submit anything yet.
+  bool cb_called = false;
+  auto& io_uring_socket = worker.addAcceptSocket(
+      fd, [&cb_called](uint32_t) { cb_called = true; return absl::OkStatus(); }, 4);
+
+  EXPECT_EQ(fd, io_uring_socket.fd());
+  EXPECT_EQ(1, worker.getSockets().size());
+  EXPECT_EQ(Initialized, io_uring_socket.getStatus());
+
+  // enableRead should submit 4 accept requests.
+  std::vector<Request*> accept_reqs(4, nullptr);
+  EXPECT_CALL(mock_io_uring, prepareAccept(fd, _, _, _))
+      .WillOnce(DoAll(SaveArg<3>(&accept_reqs[0]), Return<IoUringResult>(IoUringResult::Ok)))
+      .WillOnce(DoAll(SaveArg<3>(&accept_reqs[1]), Return<IoUringResult>(IoUringResult::Ok)))
+      .WillOnce(DoAll(SaveArg<3>(&accept_reqs[2]), Return<IoUringResult>(IoUringResult::Ok)))
+      .WillOnce(DoAll(SaveArg<3>(&accept_reqs[3]), Return<IoUringResult>(IoUringResult::Ok)));
+  EXPECT_CALL(mock_io_uring, submit()).Times(4).RetiresOnSaturation();
+  io_uring_socket.enableRead();
+  EXPECT_EQ(ReadEnabled, io_uring_socket.getStatus());
+
+  // Cleanup: close with no pending accepts by simulating all cancelled.
+  // Cancel all 4 accept requests.
+  EXPECT_CALL(mock_io_uring, prepareCancel(_, _))
+      .Times(4)
+      .WillRepeatedly(Return<IoUringResult>(IoUringResult::Ok));
+  EXPECT_CALL(mock_io_uring, submit()).Times(4).RetiresOnSaturation();
+  io_uring_socket.close(false);
+
+  // Simulate all accept requests cancelled and close completes.
+  Request* close_req = nullptr;
+  EXPECT_CALL(mock_io_uring, forEveryCompletion(_))
+      .WillOnce(Invoke([&accept_reqs, &mock_io_uring, &close_req](const CompletionCb& cb) {
+        EXPECT_CALL(mock_io_uring, prepareClose(_, _))
+            .WillOnce(DoAll(SaveArg<1>(&close_req), Return<IoUringResult>(IoUringResult::Ok)))
+            .RetiresOnSaturation();
+        EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+
+        for (auto* req : accept_reqs) {
+          cb(req, -ECANCELED, false);
+        }
+      }));
+  ASSERT_TRUE(setup.file_event_callback(Event::FileReadyType::Read).ok());
+
+  // Close completes.
+  EXPECT_CALL(mock_io_uring, forEveryCompletion(_))
+      .WillOnce(Invoke([&close_req](const CompletionCb& cb) { cb(close_req, 0, false); }));
+  EXPECT_CALL(mock_io_uring, removeInjectedCompletion(fd));
+  EXPECT_CALL(dispatcher, deferredDelete_);
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  ASSERT_TRUE(setup.file_event_callback(Event::FileReadyType::Read).ok());
+
+  EXPECT_EQ(0, worker.getSockets().size());
+}
+
+TEST(IoUringWorkerImplTest, AcceptSocketSuccessfulAccept) {
+  AcceptSocketTestSetup setup;
+  auto& mock_io_uring = *setup.mock_io_uring;
+  auto& worker = *setup.worker;
+  auto& dispatcher = setup.dispatcher;
+
+  os_fd_t fd = 11;
+  SET_SOCKET_INVALID(fd);
+
+  bool cb_called = false;
+  auto& io_uring_socket = worker.addAcceptSocket(
+      fd, [&cb_called](uint32_t events) {
+        EXPECT_EQ(events, Event::FileReadyType::Read);
+        cb_called = true;
+        return absl::OkStatus();
+      }, 2);
+
+  // enableRead submits 2 accept requests.
+  std::vector<Request*> accept_reqs(2, nullptr);
+  EXPECT_CALL(mock_io_uring, prepareAccept(fd, _, _, _))
+      .WillOnce(DoAll(SaveArg<3>(&accept_reqs[0]), Return<IoUringResult>(IoUringResult::Ok)))
+      .WillOnce(DoAll(SaveArg<3>(&accept_reqs[1]), Return<IoUringResult>(IoUringResult::Ok)));
+  EXPECT_CALL(mock_io_uring, submit()).Times(2).RetiresOnSaturation();
+  io_uring_socket.enableRead();
+
+  // Simulate one accept completing with accepted_fd = 42.
+  // A replacement SQE should be submitted.
+  Request* replacement_req = nullptr;
+  EXPECT_CALL(mock_io_uring, prepareAccept(fd, _, _, _))
+      .WillOnce(DoAll(SaveArg<3>(&replacement_req), Return<IoUringResult>(IoUringResult::Ok)));
+  EXPECT_CALL(mock_io_uring, forEveryCompletion(_))
+      .WillOnce(Invoke([&accept_reqs](const CompletionCb& cb) {
+        cb(accept_reqs[0], 42, false); // accepted_fd = 42
+      }));
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  ASSERT_TRUE(setup.file_event_callback(Event::FileReadyType::Read).ok());
+
+  EXPECT_TRUE(cb_called);
+  auto* accept_socket = dynamic_cast<IoUringAcceptSocket*>(&io_uring_socket);
+  ASSERT_NE(accept_socket, nullptr);
+  EXPECT_TRUE(accept_socket->hasPendingAccepts());
+  auto conn = accept_socket->popAcceptedConnection();
+  EXPECT_EQ(42, conn.fd);
+  EXPECT_FALSE(accept_socket->hasPendingAccepts());
+
+  // Cleanup.
+  EXPECT_CALL(mock_io_uring, prepareCancel(_, _))
+      .Times(2)
+      .WillRepeatedly(Return<IoUringResult>(IoUringResult::Ok));
+  EXPECT_CALL(mock_io_uring, submit()).Times(2).RetiresOnSaturation();
+  io_uring_socket.close(false);
+
+  Request* close_req = nullptr;
+  EXPECT_CALL(mock_io_uring, forEveryCompletion(_))
+      .WillOnce(Invoke([&accept_reqs, &replacement_req, &mock_io_uring,
+                         &close_req](const CompletionCb& cb) {
+        EXPECT_CALL(mock_io_uring, prepareClose(_, _))
+            .WillOnce(DoAll(SaveArg<1>(&close_req), Return<IoUringResult>(IoUringResult::Ok)))
+            .RetiresOnSaturation();
+        EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+        cb(accept_reqs[1], -ECANCELED, false);
+        cb(replacement_req, -ECANCELED, false);
+      }));
+  ASSERT_TRUE(setup.file_event_callback(Event::FileReadyType::Read).ok());
+
+  EXPECT_CALL(mock_io_uring, forEveryCompletion(_))
+      .WillOnce(Invoke([&close_req](const CompletionCb& cb) { cb(close_req, 0, false); }));
+  EXPECT_CALL(mock_io_uring, removeInjectedCompletion(fd));
+  EXPECT_CALL(dispatcher, deferredDelete_);
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  ASSERT_TRUE(setup.file_event_callback(Event::FileReadyType::Read).ok());
+
+  EXPECT_EQ(0, worker.getSockets().size());
+}
+
+TEST(IoUringWorkerImplTest, AcceptSocketAcceptError) {
+  AcceptSocketTestSetup setup;
+  auto& mock_io_uring = *setup.mock_io_uring;
+  auto& worker = *setup.worker;
+  auto& dispatcher = setup.dispatcher;
+
+  os_fd_t fd = 11;
+  SET_SOCKET_INVALID(fd);
+
+  bool cb_called = false;
+  auto& io_uring_socket = worker.addAcceptSocket(
+      fd, [&cb_called](uint32_t) { cb_called = true; return absl::OkStatus(); }, 1);
+
+  // enableRead submits 1 accept request.
+  Request* accept_req = nullptr;
+  EXPECT_CALL(mock_io_uring, prepareAccept(fd, _, _, _))
+      .WillOnce(DoAll(SaveArg<3>(&accept_req), Return<IoUringResult>(IoUringResult::Ok)));
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  io_uring_socket.enableRead();
+
+  // Simulate accept error (-EMFILE). Should submit a replacement.
+  Request* replacement_req = nullptr;
+  EXPECT_CALL(mock_io_uring, prepareAccept(fd, _, _, _))
+      .WillOnce(DoAll(SaveArg<3>(&replacement_req), Return<IoUringResult>(IoUringResult::Ok)));
+  EXPECT_CALL(mock_io_uring, forEveryCompletion(_))
+      .WillOnce(Invoke([&accept_req](const CompletionCb& cb) {
+        cb(accept_req, -EMFILE, false);
+      }));
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  ASSERT_TRUE(setup.file_event_callback(Event::FileReadyType::Read).ok());
+
+  // Callback should NOT have been called (no successful accept).
+  EXPECT_FALSE(cb_called);
+
+  // Cleanup.
+  EXPECT_CALL(mock_io_uring, prepareCancel(_, _))
+      .WillOnce(Return<IoUringResult>(IoUringResult::Ok));
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  io_uring_socket.close(false);
+
+  Request* close_req = nullptr;
+  EXPECT_CALL(mock_io_uring, forEveryCompletion(_))
+      .WillOnce(Invoke([&replacement_req, &mock_io_uring, &close_req](const CompletionCb& cb) {
+        EXPECT_CALL(mock_io_uring, prepareClose(_, _))
+            .WillOnce(DoAll(SaveArg<1>(&close_req), Return<IoUringResult>(IoUringResult::Ok)))
+            .RetiresOnSaturation();
+        EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+        cb(replacement_req, -ECANCELED, false);
+      }));
+  ASSERT_TRUE(setup.file_event_callback(Event::FileReadyType::Read).ok());
+
+  EXPECT_CALL(mock_io_uring, forEveryCompletion(_))
+      .WillOnce(Invoke([&close_req](const CompletionCb& cb) { cb(close_req, 0, false); }));
+  EXPECT_CALL(mock_io_uring, removeInjectedCompletion(fd));
+  EXPECT_CALL(dispatcher, deferredDelete_);
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  ASSERT_TRUE(setup.file_event_callback(Event::FileReadyType::Read).ok());
+
+  EXPECT_EQ(0, worker.getSockets().size());
+}
+
+TEST(IoUringWorkerImplTest, AcceptSocketDisableAndReEnable) {
+  AcceptSocketTestSetup setup;
+  auto& mock_io_uring = *setup.mock_io_uring;
+  auto& worker = *setup.worker;
+  auto& dispatcher = setup.dispatcher;
+
+  os_fd_t fd = 11;
+  SET_SOCKET_INVALID(fd);
+
+  auto& io_uring_socket = worker.addAcceptSocket(
+      fd, [](uint32_t) { return absl::OkStatus(); }, 2);
+
+  // enableRead submits 2 accept requests.
+  std::vector<Request*> accept_reqs(2, nullptr);
+  EXPECT_CALL(mock_io_uring, prepareAccept(fd, _, _, _))
+      .WillOnce(DoAll(SaveArg<3>(&accept_reqs[0]), Return<IoUringResult>(IoUringResult::Ok)))
+      .WillOnce(DoAll(SaveArg<3>(&accept_reqs[1]), Return<IoUringResult>(IoUringResult::Ok)));
+  EXPECT_CALL(mock_io_uring, submit()).Times(2).RetiresOnSaturation();
+  io_uring_socket.enableRead();
+
+  // disableRead — no cancels, just stops submitting new ones.
+  io_uring_socket.disableRead();
+  EXPECT_EQ(ReadDisabled, io_uring_socket.getStatus());
+
+  // An accept completes while disabled — should NOT submit replacement, should NOT call cb.
+  // The accepted FD is still queued (it will be closed on close()).
+  EXPECT_CALL(mock_io_uring, prepareAccept(fd, _, _, _)).Times(0);
+  EXPECT_CALL(mock_io_uring, forEveryCompletion(_))
+      .WillOnce(Invoke([&accept_reqs](const CompletionCb& cb) {
+        cb(accept_reqs[0], 99, false); // accepted_fd = 99
+      }));
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  ASSERT_TRUE(setup.file_event_callback(Event::FileReadyType::Read).ok());
+
+  // Re-enable — should submit 1 replacement to get back to 2.
+  Request* new_req = nullptr;
+  EXPECT_CALL(mock_io_uring, prepareAccept(fd, _, _, _))
+      .WillOnce(DoAll(SaveArg<3>(&new_req), Return<IoUringResult>(IoUringResult::Ok)));
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  io_uring_socket.enableRead();
+  EXPECT_EQ(ReadEnabled, io_uring_socket.getStatus());
+
+  // Cleanup: close should close the pending accepted FD (99) and cancel in-flight SQEs.
+  EXPECT_CALL(mock_io_uring, prepareCancel(_, _))
+      .Times(2)
+      .WillRepeatedly(Return<IoUringResult>(IoUringResult::Ok));
+  EXPECT_CALL(mock_io_uring, submit()).Times(2).RetiresOnSaturation();
+  io_uring_socket.close(false);
+
+  Request* close_req = nullptr;
+  EXPECT_CALL(mock_io_uring, forEveryCompletion(_))
+      .WillOnce(Invoke([&accept_reqs, &new_req, &mock_io_uring, &close_req](const CompletionCb& cb) {
+        EXPECT_CALL(mock_io_uring, prepareClose(_, _))
+            .WillOnce(DoAll(SaveArg<1>(&close_req), Return<IoUringResult>(IoUringResult::Ok)))
+            .RetiresOnSaturation();
+        EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+        cb(accept_reqs[1], -ECANCELED, false);
+        cb(new_req, -ECANCELED, false);
+      }));
+  ASSERT_TRUE(setup.file_event_callback(Event::FileReadyType::Read).ok());
+
+  EXPECT_CALL(mock_io_uring, forEveryCompletion(_))
+      .WillOnce(Invoke([&close_req](const CompletionCb& cb) { cb(close_req, 0, false); }));
+  EXPECT_CALL(mock_io_uring, removeInjectedCompletion(fd));
+  EXPECT_CALL(dispatcher, deferredDelete_);
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  ASSERT_TRUE(setup.file_event_callback(Event::FileReadyType::Read).ok());
+
+  EXPECT_EQ(0, worker.getSockets().size());
+}
+
+TEST(IoUringWorkerImplTest, AcceptSocketCloseWithNoInflight) {
+  AcceptSocketTestSetup setup;
+  auto& mock_io_uring = *setup.mock_io_uring;
+  auto& worker = *setup.worker;
+  auto& dispatcher = setup.dispatcher;
+
+  os_fd_t fd = 11;
+  SET_SOCKET_INVALID(fd);
+
+  auto& io_uring_socket = worker.addAcceptSocket(
+      fd, [](uint32_t) { return absl::OkStatus(); }, 2);
+
+  // Close immediately without enableRead — no in-flight requests.
+  // Should submit close directly.
+  Request* close_req = nullptr;
+  EXPECT_CALL(mock_io_uring, prepareClose(fd, _))
+      .WillOnce(DoAll(SaveArg<1>(&close_req), Return<IoUringResult>(IoUringResult::Ok)));
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  io_uring_socket.close(false);
+
+  // Close completes.
+  EXPECT_CALL(mock_io_uring, forEveryCompletion(_))
+      .WillOnce(Invoke([&close_req](const CompletionCb& cb) { cb(close_req, 0, false); }));
+  EXPECT_CALL(mock_io_uring, removeInjectedCompletion(fd));
+  EXPECT_CALL(dispatcher, deferredDelete_);
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  ASSERT_TRUE(setup.file_event_callback(Event::FileReadyType::Read).ok());
+
+  EXPECT_EQ(0, worker.getSockets().size());
+}
+
+TEST(IoUringWorkerImplTest, AcceptSocketAcceptDuringDrain) {
+  AcceptSocketTestSetup setup;
+  auto& mock_io_uring = *setup.mock_io_uring;
+  auto& worker = *setup.worker;
+  auto& dispatcher = setup.dispatcher;
+
+  os_fd_t fd = 11;
+  SET_SOCKET_INVALID(fd);
+
+  bool cb_called = false;
+  auto& io_uring_socket = worker.addAcceptSocket(
+      fd, [&cb_called](uint32_t) { cb_called = true; return absl::OkStatus(); }, 2);
+
+  // Submit 2 accept requests.
+  std::vector<Request*> accept_reqs(2, nullptr);
+  EXPECT_CALL(mock_io_uring, prepareAccept(fd, _, _, _))
+      .WillOnce(DoAll(SaveArg<3>(&accept_reqs[0]), Return<IoUringResult>(IoUringResult::Ok)))
+      .WillOnce(DoAll(SaveArg<3>(&accept_reqs[1]), Return<IoUringResult>(IoUringResult::Ok)));
+  EXPECT_CALL(mock_io_uring, submit()).Times(2).RetiresOnSaturation();
+  io_uring_socket.enableRead();
+
+  // Close — starts draining.
+  EXPECT_CALL(mock_io_uring, prepareCancel(_, _))
+      .Times(2)
+      .WillRepeatedly(Return<IoUringResult>(IoUringResult::Ok));
+  EXPECT_CALL(mock_io_uring, submit()).Times(2).RetiresOnSaturation();
+  io_uring_socket.close(false);
+
+  // One accept completes with a valid FD during drain — should be closed, not delivered.
+  // Then the other is cancelled.
+  Request* close_req = nullptr;
+  EXPECT_CALL(mock_io_uring, forEveryCompletion(_))
+      .WillOnce(Invoke([&accept_reqs, &mock_io_uring, &close_req](const CompletionCb& cb) {
+        EXPECT_CALL(mock_io_uring, prepareClose(_, _))
+            .WillOnce(DoAll(SaveArg<1>(&close_req), Return<IoUringResult>(IoUringResult::Ok)))
+            .RetiresOnSaturation();
+        EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+
+        // This accept succeeded but we are draining — the accepted fd (77) should be closed.
+        cb(accept_reqs[0], 77, false);
+        cb(accept_reqs[1], -ECANCELED, false);
+      }));
+  ASSERT_TRUE(setup.file_event_callback(Event::FileReadyType::Read).ok());
+
+  // Callback should NOT have been called.
+  EXPECT_FALSE(cb_called);
+
+  // Close completes.
+  EXPECT_CALL(mock_io_uring, forEveryCompletion(_))
+      .WillOnce(Invoke([&close_req](const CompletionCb& cb) { cb(close_req, 0, false); }));
+  EXPECT_CALL(mock_io_uring, removeInjectedCompletion(fd));
+  EXPECT_CALL(dispatcher, deferredDelete_);
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  ASSERT_TRUE(setup.file_event_callback(Event::FileReadyType::Read).ok());
+
+  EXPECT_EQ(0, worker.getSockets().size());
+}
+
+TEST(IoUringWorkerImplTest, AcceptSocketKeepFdOpen) {
+  AcceptSocketTestSetup setup;
+  auto& mock_io_uring = *setup.mock_io_uring;
+  auto& worker = *setup.worker;
+  auto& dispatcher = setup.dispatcher;
+
+  os_fd_t fd = 11;
+  SET_SOCKET_INVALID(fd);
+
+  auto& io_uring_socket = worker.addAcceptSocket(
+      fd, [](uint32_t) { return absl::OkStatus(); }, 1);
+
+  // Submit 1 accept request.
+  Request* accept_req = nullptr;
+  EXPECT_CALL(mock_io_uring, prepareAccept(fd, _, _, _))
+      .WillOnce(DoAll(SaveArg<3>(&accept_req), Return<IoUringResult>(IoUringResult::Ok)));
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  io_uring_socket.enableRead();
+
+  // Close with keep_fd_open = true.
+  bool closed_cb_called = false;
+  EXPECT_CALL(mock_io_uring, prepareCancel(_, _))
+      .WillOnce(Return<IoUringResult>(IoUringResult::Ok));
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  io_uring_socket.close(true, [&closed_cb_called](Buffer::Instance&) {
+    closed_cb_called = true;
+  });
+
+  // Cancel completes. Since keep_fd_open, no prepareClose — just cleanup.
+  EXPECT_CALL(mock_io_uring, prepareClose(_, _)).Times(0);
+  EXPECT_CALL(mock_io_uring, forEveryCompletion(_))
+      .WillOnce(Invoke([&accept_req](const CompletionCb& cb) {
+        cb(accept_req, -ECANCELED, false);
+      }));
+  EXPECT_CALL(mock_io_uring, removeInjectedCompletion(fd));
+  EXPECT_CALL(dispatcher, deferredDelete_);
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  ASSERT_TRUE(setup.file_event_callback(Event::FileReadyType::Read).ok());
+
+  EXPECT_TRUE(closed_cb_called);
+  EXPECT_EQ(0, worker.getSockets().size());
+}
+
+TEST(IoUringWorkerImplTest, SubmitAcceptRequestFailed) {
+  Event::MockDispatcher dispatcher;
+  IoUringPtr io_uring_instance = std::make_unique<MockIoUring>();
+  MockIoUring& mock_io_uring = *dynamic_cast<MockIoUring*>(io_uring_instance.get());
+
+  EXPECT_CALL(mock_io_uring, registerEventfd());
+  EXPECT_CALL(dispatcher, createFileEvent_(_, _, Event::PlatformDefaultTriggerType,
+                                           Event::FileReadyType::Read));
+  IoUringWorkerTestImpl worker(std::move(io_uring_instance), dispatcher);
+
+  os_fd_t fd;
+  SET_SOCKET_INVALID(fd);
+  auto& io_uring_socket = worker.addTestSocket(fd);
+
+  // First prepareAccept succeeds, second fails then succeeds on retry.
+  EXPECT_CALL(mock_io_uring, prepareAccept(fd, _, _, _))
+      .WillOnce(Return<IoUringResult>(IoUringResult::Ok))
+      .RetiresOnSaturation();
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  EXPECT_CALL(mock_io_uring, prepareAccept(fd, _, _, _))
+      .WillOnce(Return<IoUringResult>(IoUringResult::Failed))
+      .RetiresOnSaturation();
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  delete worker.submitAcceptRequest(io_uring_socket);
+
+  EXPECT_CALL(mock_io_uring, removeInjectedCompletion(fd));
+  EXPECT_CALL(dispatcher, deferredDelete_);
+  dynamic_cast<IoUringSocketTestImpl*>(worker.getSockets().front().get())->cleanupForTest();
+  EXPECT_EQ(0, worker.getNumOfSockets());
+  EXPECT_CALL(dispatcher, clearDeferredDeleteList());
+}
+
 } // namespace
 } // namespace Io
 } // namespace Envoy
