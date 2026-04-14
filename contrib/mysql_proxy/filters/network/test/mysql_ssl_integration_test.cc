@@ -112,7 +112,10 @@ public:
   }
 
   // Upgrade the client connection to TLS.
+  // Wait for the filter to process the SSL request and call startSecureTransport()
+  // before initiating the client-side TLS handshake.
   void upgradeClientToTls() {
+    test_server_->waitForCounterGe("mysql.mysql_stats.upgraded_to_ssl", 1);
     conn_->upgradeToTls(tls_context_->createTransportSocket(
         std::make_shared<Network::TransportSocketOptionsImpl>(
             absl::string_view(""), std::vector<std::string>(), std::vector<std::string>()),
@@ -683,6 +686,7 @@ public:
   }
 
   void upgradeClientToTls() {
+    test_server_->waitForCounterGe("mysql.mysql_stats.upgraded_to_ssl", 1);
     conn_->upgradeToTls(tls_context_->createTransportSocket(
         std::make_shared<Network::TransportSocketOptionsImpl>(
             absl::string_view(""), std::vector<std::string>(), std::vector<std::string>()),
